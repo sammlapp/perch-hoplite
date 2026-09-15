@@ -264,6 +264,29 @@ class Annotation(DynamicInfo):
     ) < min(self.offsets[1], other.offsets[1])
 
 
+@dataclasses.dataclass(init=False, repr=False, eq=False)
+class Detection(DynamicInfo):
+  """A single-class, score-thresholded detection.
+
+  Unlike `Window`, a `Detection` does not carry a full embedding or
+  class-score vector: it records only the single (class, score) pair that
+  caused it to be surfaced (e.g. by thresholding a wide per-class score
+  matrix stored elsewhere, such as in a Parquet file).
+  """
+
+  id: int
+  recording_id: int
+  offsets: list[float]
+  class_name: str
+  score: float
+
+  def intersects(self, other: Union[Window, Annotation]) -> bool:
+    """Check if this detection intersects with a window or annotation."""
+    return self.recording_id == other.recording_id and max(
+        self.offsets[0], other.offsets[0]
+    ) < min(self.offsets[1], other.offsets[1])
+
+
 @dataclasses.dataclass
 class HopliteConfig:
   """Config dataclass used to handle ConfigDict objects in Hoplite databases."""

@@ -51,6 +51,10 @@ tf-cuda = [
 onnx = [
     "onnxruntime>=1.20",
 ]
+parquet = [
+    "duckdb>=1.0,<2.0",
+    "pyarrow>=17.0",
+]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
