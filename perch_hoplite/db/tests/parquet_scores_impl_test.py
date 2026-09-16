@@ -398,8 +398,9 @@ class ParquetScoresDBTest(parameterized.TestCase):
         np.float16
     )
     db.insert_deployment_scores(deployment_id, recording_ids, [0.0], [3.0], scores)
-    parquet_path = db.deployment_parquet_path(deployment_id)
-    self.assertTrue(parquet_path.exists())
+    chunk_paths = db.deployment_chunk_paths(deployment_id)
+    self.assertLen(chunk_paths, 1)
+    self.assertTrue(chunk_paths[0].exists())
 
     db.remove_deployment(deployment_id)
 
@@ -407,7 +408,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
     self.assertEmpty(db.get_all_recordings())
     self.assertEmpty(db.get_all_annotations())
     self.assertEmpty(db.get_all_detections())
-    self.assertFalse(parquet_path.exists())
+    self.assertFalse(chunk_paths[0].exists())
 
   def test_remove_deployment_missing_raises_keyerror(self):
     db = self.make_db()
@@ -1539,7 +1540,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
         deployment_id, [recording_ids[1]], [0.0], [3.0], scores_2
     )
 
-    chunk_paths = db._deployment_chunk_paths(deployment_id)
+    chunk_paths = db.deployment_chunk_paths(deployment_id)
     self.assertLen(chunk_paths, 2)
 
     batch = db.get_scores_batch(
@@ -1587,7 +1588,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
     )
     np.testing.assert_allclose(batch[0:1], old_scores)
     np.testing.assert_allclose(batch[1:2], new_scores_for_new)
-    self.assertLen(db._deployment_chunk_paths(deployment_id), 2)
+    self.assertLen(db.deployment_chunk_paths(deployment_id), 2)
 
   def test_insert_deployment_scores_empty_batch_writes_nothing(self):
     db = self.make_db()
@@ -1596,14 +1597,14 @@ class ParquetScoresDBTest(parameterized.TestCase):
 
     db.insert_deployment_scores(deployment_id, [], [], [], scores)
 
-    self.assertEmpty(db._deployment_chunk_paths(deployment_id))
+    self.assertEmpty(db.deployment_chunk_paths(deployment_id))
 
   def test_handle_existing_recordings_skip_all_existing_writes_nothing(self):
     db = self.make_db()
     deployment_id, recording_ids = self.insert_deployment_with_recordings(db)
     scores = np.zeros((1, len(CLASS_LABELS)), dtype=np.float16)
     db.insert_deployment_scores(deployment_id, recording_ids, [0.0], [3.0], scores)
-    chunk_paths_before = db._deployment_chunk_paths(deployment_id)
+    chunk_paths_before = db.deployment_chunk_paths(deployment_id)
 
     db.insert_deployment_scores(
         deployment_id,
@@ -1615,7 +1616,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
     )
 
     self.assertEqual(
-        chunk_paths_before, db._deployment_chunk_paths(deployment_id)
+        chunk_paths_before, db.deployment_chunk_paths(deployment_id)
     )
 
   def test_handle_existing_recordings_error_partial_overlap_writes_nothing(
@@ -1632,7 +1633,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
         [3.0],
         np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
     )
-    chunk_paths_before = db._deployment_chunk_paths(deployment_id)
+    chunk_paths_before = db.deployment_chunk_paths(deployment_id)
 
     with self.assertRaises(ValueError):
       db.insert_deployment_scores(
@@ -1645,7 +1646,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
 
     # Nothing written: same chunk file(s) as before the failed call.
     self.assertEqual(
-        chunk_paths_before, db._deployment_chunk_paths(deployment_id)
+        chunk_paths_before, db.deployment_chunk_paths(deployment_id)
     )
 
   def test_handle_existing_recordings_overwrite_spans_multiple_chunks(self):
@@ -1661,7 +1662,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
     db.insert_deployment_scores(
         deployment_id, [recording_ids[1]], [0.0], [3.0], scores_b
     )
-    chunk_paths_before = db._deployment_chunk_paths(deployment_id)
+    chunk_paths_before = db.deployment_chunk_paths(deployment_id)
     self.assertLen(chunk_paths_before, 2)
     chunk_path_by_recording_before = {
         r: db.get_recording(r).score_chunk_path for r in recording_ids
@@ -1679,7 +1680,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
 
     # No new chunk written (every recording in the batch already existed).
     self.assertEqual(
-        chunk_paths_before, db._deployment_chunk_paths(deployment_id)
+        chunk_paths_before, db.deployment_chunk_paths(deployment_id)
     )
     # `score_chunk_path` is unchanged for both recordings -- updated in
     # place, not moved to a new chunk.
@@ -1722,7 +1723,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
     self.assertIsNotNone(
         db.get_recording(recording_ids[1]).score_chunk_path
     )
-    self.assertLen(db._deployment_chunk_paths(deployment_id), 2)
+    self.assertLen(db.deployment_chunk_paths(deployment_id), 2)
     batch = db.get_scores_batch(
         deployment_id, recording_ids, [0.0, 0.0], [3.0, 3.0]
     )
@@ -1741,7 +1742,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
           [3.0],
           np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
       )
-    chunk_paths = db._deployment_chunk_paths(deployment_id)
+    chunk_paths = db.deployment_chunk_paths(deployment_id)
     self.assertLen(chunk_paths, 3)
     for chunk_path in chunk_paths:
       self.assertTrue(chunk_path.exists())

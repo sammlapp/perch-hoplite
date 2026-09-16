@@ -669,24 +669,16 @@ class ParquetScoresDB(interface.HopliteDBInterface):
   def scores_dir(self) -> epath.Path:
     return self.db_path / SCORES_DIRNAME
 
-  def deployment_parquet_path(self, deployment_id: int) -> epath.Path:
-    """Path to a deployment's first (or only) score-chunk Parquet file.
-
-    Kept for backwards compatibility / discoverability; a deployment written
-    across multiple `insert_deployment_scores()` calls has additional chunk
-    files alongside this one (`deployment_{id}_1.parquet`,
-    `deployment_{id}_2.parquet`, ...) -- see `_deployment_chunk_paths()` for
-    the full set.
-    """
-    return self.scores_dir / f'deployment_{deployment_id}_0.parquet'
-
-  def _deployment_chunk_paths(self, deployment_id: int) -> list[epath.Path]:
+  def deployment_chunk_paths(self, deployment_id: int) -> list[epath.Path]:
     """All existing score-chunk Parquet file paths for a deployment.
 
-    Derived from `recordings.score_chunk_path` (the source of truth for
-    where a recording's scores live -- see PARQUET_DUCKDB_PLAN.md, Q9)
-    rather than a directory listing, so this reflects exactly the chunks
-    that are actually referenced by a recording, in a stable order.
+    A deployment's scores live in one or more Parquet "chunk" files (one
+    new chunk per `insert_deployment_scores()` call) -- there is no single,
+    fixed "the" Parquet file for a deployment. Derived from
+    `recordings.score_chunk_path` (the source of truth for where a
+    recording's scores live -- see PARQUET_DUCKDB_PLAN.md, Q9) rather than
+    a directory listing, so this reflects exactly the chunks that are
+    actually referenced by a recording, in a stable order.
     """
     rows = self.db.execute(
         'SELECT DISTINCT score_chunk_path FROM recordings'
@@ -1256,8 +1248,8 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     deployment_id = int(deployment_id)
 
     # Looked up before `recordings` rows are deleted below, since
-    # `_deployment_chunk_paths()` reads `recordings.score_chunk_path`.
-    chunk_paths = self._deployment_chunk_paths(deployment_id)
+    # `deployment_chunk_paths()` reads `recordings.score_chunk_path`.
+    chunk_paths = self.deployment_chunk_paths(deployment_id)
 
     recording_ids = [
         row[0]
@@ -1863,7 +1855,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     import pyarrow.parquet as pq  # pylint: disable=g-import-not-at-top
 
     if deployment_id is not None:
-      chunk_paths = self._deployment_chunk_paths(int(deployment_id))
+      chunk_paths = self.deployment_chunk_paths(int(deployment_id))
     else:
       chunk_paths = [
           epath.Path(row[0])
@@ -2331,7 +2323,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     class_column = self._class_column(class_name)
     branches = []
     for deployment_id in deployment_ids:
-      chunk_paths = self._deployment_chunk_paths(deployment_id)
+      chunk_paths = self.deployment_chunk_paths(deployment_id)
       if not chunk_paths:
         continue
       paths_str = ', '.join(f"'{p.as_posix()}'" for p in chunk_paths)
@@ -2375,7 +2367,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     )
     branches = []
     for deployment_id in deployment_ids:
-      chunk_paths = self._deployment_chunk_paths(deployment_id)
+      chunk_paths = self.deployment_chunk_paths(deployment_id)
       if not chunk_paths:
         continue
       paths_str = ', '.join(f"'{p.as_posix()}'" for p in chunk_paths)
@@ -2417,7 +2409,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     """
     branches = []
     for deployment_id in deployment_ids:
-      chunk_paths = self._deployment_chunk_paths(deployment_id)
+      chunk_paths = self.deployment_chunk_paths(deployment_id)
       if not chunk_paths:
         continue
       paths_str = ', '.join(f"'{p.as_posix()}'" for p in chunk_paths)
@@ -2461,7 +2453,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     )
     branches = []
     for deployment_id in deployment_ids:
-      chunk_paths = self._deployment_chunk_paths(deployment_id)
+      chunk_paths = self.deployment_chunk_paths(deployment_id)
       if not chunk_paths:
         continue
       paths_str = ', '.join(f"'{p.as_posix()}'" for p in chunk_paths)
