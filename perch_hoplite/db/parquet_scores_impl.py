@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DuckDB + Parquet database implementation for wide per-window class scores.
+"""DuckDB + Parquet database implementation for wide per-window class scores
+and/or discrete event detections.
 
 Unlike `sqlite_usearch_impl.SQLiteUSearchDB` (built around one embedding
 vector per window, indexed for approximate nearest-neighbor search), this
-backend is for model outputs that are a *wide vector of class scores* per
-window (e.g. 10-500 classes, up to ~10k), where the dominant access pattern
-is columnar ("give me every score for class X across many files") rather
+backend handles classification outputs in two formats:
+1. model outputs that are a wide table: a *vector of class scores per
+window* (e.g. 10-500 classes, up to ~10k), where the dominant access pattern
+is columnar ("give me every/top scores for class X across many files") rather
 than vector similarity search.
+2. sparse, thresholded *detections* (single-class hits) with time bounds
 
 Design (see `PARQUET_DUCKDB_PLAN.md` for the full design discussion):
   - All relational metadata (`hoplite_metadata`, `deployments`, `recordings`,
@@ -29,12 +32,16 @@ Design (see `PARQUET_DUCKDB_PLAN.md` for the full design discussion):
     There is no SQLite involved anywhere in this backend.
   - There is no `windows` table. A "window" (a scored clip) is addressed
     purely by `(recording_id, start_time, end_time)`, which already uniquely
-    locates its row in the deployment's Parquet file; no synthetic per-clip
-    id is minted. `insert_window`, `get_window`, `remove_window`, and
-    `get_window_annotations` all raise `NotImplementedError`.
-  - The wide class-score matrix itself lives in one Parquet file per
-    deployment (not in DuckDB tables), written in bulk and read via DuckDB's
-    `parquet_scan`/`read_parquet`.
+    locates its row in its deployment's score chunk file(s); no synthetic
+    per-clip id is minted. `insert_window`, `get_window`, `remove_window`,
+    and `get_window_annotations` all raise `NotImplementedError`.
+  - The wide class-score matrix itself lives in one or more Parquet "chunk"
+    files per deployment (not in DuckDB tables), written in bulk (one new
+    chunk file per `insert_deployment_scores()` call -- see that method and
+    PARQUET_DUCKDB_PLAN.md, Q9) and read via DuckDB's
+    `parquet_scan`/`read_parquet` over all of a deployment's chunks at
+    once. `recordings.score_chunk_path` records which chunk file holds a
+    given recording's scores.
   - `detections` is a new, small, id-bearing table for sparse
     score-thresholded single-class hits (see `datatypes.Detection`) -- this
     plays the role `windows` plays in other backends as the reviewable unit
@@ -117,7 +124,13 @@ _METADATA_TABLES = (
 # `ParquetScoresDB._validate_filter_columns`).
 _DEFAULT_TABLE_COLUMNS = {
     'deployments': {'id', 'name', 'project', 'latitude', 'longitude'},
-    'recordings': {'id', 'filename', 'datetime', 'deployment_id'},
+    'recordings': {
+        'id',
+        'filename',
+        'datetime',
+        'deployment_id',
+        'score_chunk_path',
+    },
     'annotations': {
         'id',
         'recording_id',
@@ -430,6 +443,204 @@ def format_sql_where_conditions(
 
 
 @dataclasses.dataclass
+class ScoreBatch:
+  """A struct-of-arrays batch of scored windows, as returned by `get_scores()`.
+
+  Mirrors the parallel-array shape `insert_deployment_scores()`/
+  `get_scores_batch()` already use, rather than a DataFrame or a list of
+  per-window objects: every field except `scores` and `class_labels` is a
+  length-`N` array with one entry per window (`scores[i]`/`recording_ids[i]`/
+  etc. all describe the same window `i`); `scores` is `[N, n_classes]` (the
+  full class-score vector for each of the `N` windows); `class_labels` is
+  the fixed, length-`n_classes` column vocabulary shared by every row (not
+  itself indexed by window).
+  """
+
+  deployment_ids: np.ndarray
+  recording_ids: np.ndarray
+  start_times: np.ndarray
+  end_times: np.ndarray
+  scores: np.ndarray
+  class_labels: Sequence[str]
+
+  def __len__(self) -> int:
+    return len(self.recording_ids)
+
+  def __getitem__(self, idx: int) -> dict[str, Any]:
+    """Get a single window's data as a dict-of-values/arrays."""
+    if not 0 <= idx < len(self):
+      raise IndexError(f'Index {idx} out of bounds for ScoreBatch of length {len(self)}.')
+    return {
+        'deployment_id': self.deployment_ids[idx],
+        'recording_id': self.recording_ids[idx],
+        'start_time': self.start_times[idx],
+        'end_time': self.end_times[idx],
+        'scores': self.scores[idx],
+        'class_labels': self.class_labels,
+    }
+
+  def to_pandas(self) -> 'pd.DataFrame':
+    """Convert this batch to a pandas DataFrame with one row per window.
+
+    Each class score is a separate column, named after the class label
+    """
+    import pandas as pd  # pyrefly: ignore[import-error]
+    metadata_df = pd.DataFrame({
+        'deployment_id': self.deployment_ids,
+        'recording_id': self.recording_ids,
+        'start_time': self.start_times,
+        'end_time': self.end_times,
+    })
+    score_df = pd.DataFrame(self.scores, columns=self.class_labels)
+    return pd.concat([metadata_df, score_df], axis=1)
+
+
+def add_deployment_metadata(
+    db: 'ParquetScoresDB',
+    df: 'pd.DataFrame',
+    foreign_key: str = 'deployment_id',
+) -> 'pd.DataFrame':
+  """Left-join `deployments` columns (including any extras) onto `df`.
+
+  A standalone helper, not tied to `ScoreBatch.to_pandas()`'s output
+  specifically -- works on any DataFrame that has a `foreign_key` column of
+  deployment ids (e.g. `select_scores()`'s or `sampling_effort()`'s output
+  too, or a hand-built frame). Only fetches metadata for the deployment ids
+  actually present in `df`, not the whole table.
+
+  Args:
+    db: The database to fetch deployment metadata from.
+    df: A DataFrame with a `foreign_key` column of deployment ids.
+    foreign_key: The column in `df` holding deployment ids. Must not
+      collide with `'id'` (deployments' own primary-key column name, which
+      the join brings in from the other side) unless `foreign_key` is
+      itself `'id'`.
+
+  Returns:
+    A new DataFrame with every column of `deployments` *except* `id`
+    (redundant with `foreign_key`, which already identifies the deployment,
+    unless `foreign_key` is itself `'id'`) -- `name` (renamed to
+    `deployment_name`, since a bare `name` is ambiguous once merged with
+    other tables' columns), `project`, `latitude`, `longitude`, and any
+    extra columns added via `add_extra_table_column('deployments', ...)` --
+    placed first, followed by `df`'s original columns in their original
+    order, left-joined on `foreign_key == deployments.id`. Rows in `df`
+    whose `foreign_key` doesn't match any deployment (should not normally
+    happen, since deployment ids are foreign-key-enforced) get `NaN` for
+    the deployment columns rather than being dropped. If `df` already has a
+    `deployment_name` column (e.g. it came from `select_scores()`/
+    `select_detections()`, which always include one), the incoming one is
+    dropped rather than duplicated or `_x`/`_y`-suffixed. Any other
+    deployment extra column that happens to share a name with an existing
+    `df` column still gets pandas' default `_x`/`_y` suffixing (see
+    `pandas.DataFrame.merge`).
+  """
+  if foreign_key not in df.columns:
+    raise ValueError(
+        f'`{foreign_key}` is not a column of `df`. Available columns:'
+        f' {list(df.columns)}.'
+    )
+  deployment_ids = [int(v) for v in df[foreign_key].unique()]
+  # Query DuckDB directly (rather than going through `get_all_deployments()`
+  # + `Deployment.to_kwargs()`) so the result always has every `deployments`
+  # column -- `name`, `project`, `latitude`, `longitude`, extras -- even
+  # when zero rows match (e.g. no `foreign_key` values in `df`, or ids that
+  # don't exist): DuckDB's own schema is authoritative, unlike a
+  # `pd.DataFrame` built from an empty list of dicts, which would have no
+  # columns at all and make the merge below silently add nothing instead of
+  # the all-`NaN` deployment columns callers expect.
+  placeholders = ', '.join(['?'] * len(deployment_ids)) or 'NULL'
+  deployments_df = db.db.execute(
+      f'SELECT * FROM deployments WHERE id IN ({placeholders})',
+      deployment_ids,
+  ).fetchdf()
+  # `deployments.id` is redundant with `foreign_key` once joined (both
+  # identify the same deployment); renaming it to `foreign_key` before the
+  # merge lets `on=foreign_key` do the join without leaving a duplicate
+  # `id`/`{foreign_key}` pair or `_x`/`_y`-suffixing either of them.
+  if foreign_key != 'id':
+    deployments_df = deployments_df.rename(columns={'id': foreign_key})
+  # `name` field is ambiguous, call it `deployment_name` for clarity -- but
+  # if `df` already has a `deployment_name` column (e.g. it came from
+  # `select_scores()`/`select_detections()`, which always include one),
+  # drop the incoming one rather than let it collide and get `_x`/`_y`
+  # suffixed, since both name the same thing.
+  deployments_df = deployments_df.rename(columns={'name': 'deployment_name'})
+  if 'deployment_name' in df.columns and 'deployment_name' in deployments_df.columns:
+    deployments_df = deployments_df.drop(columns=['deployment_name'])
+  merged = df.merge(deployments_df, on=foreign_key, how='left')
+  # `merge()` appends new columns at the end; reorder so the newly-added
+  # deployment columns lead, followed by `df`'s original columns, which
+  # makes the merged-in metadata easy to spot at a glance rather than
+  # scrolled off to the right of however many score/class columns `df` had.
+  new_columns = [c for c in deployments_df.columns if c != foreign_key]
+  return merged[new_columns + list(df.columns)]
+
+
+def add_recording_metadata(
+    db: 'ParquetScoresDB',
+    df: 'pd.DataFrame',
+    foreign_key: str = 'recording_id',
+) -> 'pd.DataFrame':
+  """Left-join `recordings` columns (including any extras) onto `df`.
+
+  A standalone helper, not tied to `ScoreBatch.to_pandas()`'s output
+  specifically -- works on any DataFrame that has a `foreign_key` column of
+  recording ids. Only fetches metadata for the recording ids actually
+  present in `df`, not the whole table.
+
+  Args:
+    db: The database to fetch recording metadata from.
+    df: A DataFrame with a `foreign_key` column of recording ids.
+    foreign_key: The column in `df` holding recording ids. Must not
+      collide with `'id'` (recordings' own primary-key column name, which
+      the join brings in from the other side) unless `foreign_key` is
+      itself `'id'`.
+
+  Returns:
+    A new DataFrame with every column of `recordings` *except* `id`
+    (redundant with `foreign_key`, unless `foreign_key` is itself `'id'`)
+    -- `filename`, `datetime`, `deployment_id`, `score_chunk_path`, and any
+    extra columns added via `add_extra_table_column('recordings', ...)` --
+    placed first, followed by `df`'s original columns in their original
+    order, left-joined on `foreign_key == recordings.id`. Rows in `df`
+    whose `foreign_key` doesn't match any recording get `NaN` for the
+    recording columns rather than being dropped. If `df` already has a
+    `deployment_id` column (e.g.
+    from a prior `add_deployment_metadata()` call, or because `df` came
+    from `ScoreBatch.to_pandas()`), `recordings.deployment_id` is dropped
+    rather than duplicated or `_x`/`_y`-suffixed, since it names the same
+    deployment either way. Any other recording extra column that happens to
+    share a name with an existing `df` column still gets pandas' default
+    `_x`/`_y` suffixing (see `pandas.DataFrame.merge`).
+  """
+  if foreign_key not in df.columns:
+    raise ValueError(
+        f'`{foreign_key}` is not a column of `df`. Available columns:'
+        f' {list(df.columns)}.'
+    )
+  recording_ids = [int(v) for v in df[foreign_key].unique()]
+  # See `add_deployment_metadata()` for why this queries DuckDB directly
+  # rather than going through `get_all_recordings()` + `to_kwargs()`.
+  placeholders = ', '.join(['?'] * len(recording_ids)) or 'NULL'
+  recordings_df = db.db.execute(
+      f'SELECT * FROM recordings WHERE id IN ({placeholders})',
+      recording_ids,
+  ).fetchdf()
+  # See `add_deployment_metadata()` for why `id` is renamed rather than
+  # left to collide with `foreign_key`.
+  if foreign_key != 'id':
+    recordings_df = recordings_df.rename(columns={'id': foreign_key})
+  if 'deployment_id' in df.columns and 'deployment_id' in recordings_df.columns:
+    recordings_df = recordings_df.drop(columns=['deployment_id'])
+  merged = df.merge(recordings_df, on=foreign_key, how='left')
+  # See `add_deployment_metadata()` for why the newly-added columns are
+  # reordered to lead rather than trail.
+  new_columns = [c for c in recordings_df.columns if c != foreign_key]
+  return merged[new_columns + list(df.columns)]
+
+
+@dataclasses.dataclass
 class ParquetScoresDB(interface.HopliteDBInterface):
   """DuckDB + per-deployment-Parquet database for wide class-score outputs.
 
@@ -459,8 +670,53 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     return self.db_path / SCORES_DIRNAME
 
   def deployment_parquet_path(self, deployment_id: int) -> epath.Path:
-    """Path to the Parquet file holding scores for one deployment."""
-    return self.scores_dir / f'deployment_{deployment_id}.parquet'
+    """Path to a deployment's first (or only) score-chunk Parquet file.
+
+    Kept for backwards compatibility / discoverability; a deployment written
+    across multiple `insert_deployment_scores()` calls has additional chunk
+    files alongside this one (`deployment_{id}_1.parquet`,
+    `deployment_{id}_2.parquet`, ...) -- see `_deployment_chunk_paths()` for
+    the full set.
+    """
+    return self.scores_dir / f'deployment_{deployment_id}_0.parquet'
+
+  def _deployment_chunk_paths(self, deployment_id: int) -> list[epath.Path]:
+    """All existing score-chunk Parquet file paths for a deployment.
+
+    Derived from `recordings.score_chunk_path` (the source of truth for
+    where a recording's scores live -- see PARQUET_DUCKDB_PLAN.md, Q9)
+    rather than a directory listing, so this reflects exactly the chunks
+    that are actually referenced by a recording, in a stable order.
+    """
+    rows = self.db.execute(
+        'SELECT DISTINCT score_chunk_path FROM recordings'
+        ' WHERE deployment_id = ? AND score_chunk_path IS NOT NULL'
+        ' ORDER BY score_chunk_path',
+        [int(deployment_id)],
+    ).fetchall()
+    return [epath.Path(row[0]) for row in rows]
+
+  def _next_chunk_path(self, deployment_id: int) -> epath.Path:
+    """The path a new score chunk for `deployment_id` should be written to.
+
+    Numbered by globbing `scores_dir` for the highest existing numeric
+    suffix and adding 1, rather than by counting rows in `recordings` --
+    this stays correct even if a prior write's Parquet file landed on disk
+    (atomic rename succeeded) but the follow-up `recordings.score_chunk_path`
+    update never completed (e.g. a crash in between; see
+    `insert_deployment_scores()`), which would otherwise make a stale,
+    unreferenced chunk file collide with the next chunk number chosen.
+    """
+    deployment_id = int(deployment_id)
+    prefix = f'deployment_{deployment_id}_'
+    existing_suffixes = []
+    if self.scores_dir.exists():  # pyrefly: ignore[unsupported-operation]
+      for path in self.scores_dir.glob(f'{prefix}*.parquet'):  # pyrefly: ignore[unsupported-operation]
+        suffix = path.stem[len(prefix) :]
+        if suffix.isdigit():
+          existing_suffixes.append(int(suffix))
+    next_n = max(existing_suffixes, default=-1) + 1
+    return self.scores_dir / f'{prefix}{next_n}.parquet'
 
   @staticmethod
   def _setup_tables(db: duckdb.DuckDBPyConnection) -> None:
@@ -506,6 +762,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
             filename VARCHAR NOT NULL,
             datetime TIMESTAMPTZ,
             deployment_id INTEGER REFERENCES deployments(id),
+            score_chunk_path VARCHAR,
             UNIQUE (filename, deployment_id)
         )
         """)
@@ -747,6 +1004,27 @@ class ParquetScoresDB(interface.HopliteDBInterface):
                 f' {sorted(valid_columns)}.'
             )
 
+  def _validate_columns(self, table: str, columns: Sequence[str]) -> None:
+    """Raise a clear `ValueError` if `columns` references an unknown column.
+
+    Like `_validate_filter_columns()`, but for a plain list of column names
+    rather than a filter dict -- used by `by_deployment_fields` in
+    `select_scores()`/`select_detections()`.
+
+    Args:
+      table: The table `columns` are expected to be columns of.
+      columns: The column names to validate.
+    """
+    valid_columns = (
+        _DEFAULT_TABLE_COLUMNS[table] | self._extra_table_columns[table].keys()
+    )
+    for column in columns:
+      if column not in valid_columns:
+        raise ValueError(
+            f'Unknown column `{column}` for table `{table}`. Valid columns'
+            f' are: {sorted(valid_columns)}.'
+        )
+
   # ---------------------------------------------------------------------
   # Transactions / connection management.
   # ---------------------------------------------------------------------
@@ -971,11 +1249,15 @@ class ParquetScoresDB(interface.HopliteDBInterface):
 
     This also removes all recordings/annotations/detections belonging to the
     deployment (DuckDB does not support `ON DELETE CASCADE`, so this is done
-    explicitly), and deletes the deployment's score Parquet file outright
-    (rather than leaving orphaned rows behind -- see PARQUET_DUCKDB_PLAN.md,
-    Q6).
+    explicitly), and deletes all of the deployment's score-chunk Parquet
+    files outright (rather than leaving orphaned rows behind -- see
+    PARQUET_DUCKDB_PLAN.md, Q6/Q9).
     """
     deployment_id = int(deployment_id)
+
+    # Looked up before `recordings` rows are deleted below, since
+    # `_deployment_chunk_paths()` reads `recordings.score_chunk_path`.
+    chunk_paths = self._deployment_chunk_paths(deployment_id)
 
     recording_ids = [
         row[0]
@@ -1005,9 +1287,9 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     if not result:
       raise KeyError(f'Deployment id not found: {deployment_id}')
 
-    parquet_path = self.deployment_parquet_path(deployment_id)
-    if parquet_path.exists():
-      parquet_path.unlink()
+    for chunk_path in chunk_paths:
+      if chunk_path.exists():  # pyrefly: ignore[unsupported-operation]
+        chunk_path.unlink()  # pyrefly: ignore[unsupported-operation]
 
   # ---------------------------------------------------------------------
   # recordings.
@@ -1494,6 +1776,107 @@ class ParquetScoresDB(interface.HopliteDBInterface):
         ' the score Parquet files directly for counts of scored windows.'
     )
 
+  def count_recordings(
+      self,
+      filter: config_dict.ConfigDict | None = None,  # pylint: disable=redefined-builtin
+  ) -> int:
+    """Count recordings in the database, with optional filtering."""
+    self._validate_filter_columns('recordings', filter)
+    conditions_str, values = format_sql_where_conditions(filter)
+    where_clause = f'WHERE {conditions_str}' if conditions_str else ''
+    return self.db.execute(
+        f'SELECT COUNT(*) FROM recordings {where_clause}', values
+    ).fetchone()[0]
+
+  def count_detections(
+      self,
+      filter: config_dict.ConfigDict | None = None,  # pylint: disable=redefined-builtin
+      recordings_filter: config_dict.ConfigDict | None = None,
+      deployments_filter: config_dict.ConfigDict | None = None,
+  ) -> int:
+    """Count detections in the database, with optional filtering.
+
+    Args mirror `get_all_detections()`; this is `len(get_all_detections(...))`
+    computed via `COUNT(*)` in SQL rather than materializing every matching
+    `Detection`.
+    """
+    self._validate_filter_columns('detections', filter)
+    self._validate_filter_columns('recordings', recordings_filter)
+    self._validate_filter_columns('deployments', deployments_filter)
+    from_clause = 'FROM detections'
+    query_tables = {'detections'}
+    if recordings_filter:
+      query_tables |= {'recordings'}
+    if deployments_filter:
+      query_tables |= {'recordings', 'deployments'}
+    if 'recordings' in query_tables:
+      from_clause += (
+          ' JOIN recordings ON detections.recording_id = recordings.id'
+      )
+    if 'deployments' in query_tables:
+      from_clause += (
+          ' JOIN deployments ON recordings.deployment_id = deployments.id'
+      )
+
+    conditions, values = tuple(
+        zip(*[
+            format_sql_where_conditions(filter, table_prefix='detections'),
+            format_sql_where_conditions(
+                recordings_filter, table_prefix='recordings'
+            ),
+            format_sql_where_conditions(
+                deployments_filter, table_prefix='deployments'
+            ),
+        ])
+    )
+    conditions_str = ' AND '.join(c for c in conditions if c)
+    values = [v for vs in values for v in vs]
+    where_clause = f'WHERE {conditions_str}' if conditions_str else ''
+
+    select_clause = (
+        'SELECT COUNT(DISTINCT detections.id)'
+        if len(query_tables) > 1
+        else 'SELECT COUNT(*)'
+    )
+    return self.db.execute(
+        f'{select_clause} {from_clause} {where_clause}', values
+    ).fetchone()[0]
+
+  def count_windows(self, deployment_id: int | None = None) -> int:
+    """Count scored windows (rows across score chunk Parquet files).
+
+    Reads only each chunk file's Parquet footer metadata (`num_rows`), never
+    the actual score data -- so this is cheap regardless of how wide the
+    class vocabulary is or how many rows a deployment has, unlike a `COUNT(*)`
+    query over `read_parquet(...)`, which would still need to open and scan
+    the files (DuckDB can sometimes optimize a bare `COUNT(*)` this way too,
+    but reading the footer directly makes the cost explicit and avoids
+    relying on query-planner behavior).
+
+    Args:
+      deployment_id: If provided, count only this deployment's windows. If
+        omitted, counts windows across every deployment in the database.
+
+    Returns:
+      The total number of scored windows (rows).
+    """
+    import pyarrow.parquet as pq  # pylint: disable=g-import-not-at-top
+
+    if deployment_id is not None:
+      chunk_paths = self._deployment_chunk_paths(int(deployment_id))
+    else:
+      chunk_paths = [
+          epath.Path(row[0])
+          for row in self.db.execute(
+              'SELECT DISTINCT score_chunk_path FROM recordings'
+              ' WHERE score_chunk_path IS NOT NULL'
+          ).fetchall()
+      ]
+    return sum(
+        pq.ParquetFile(chunk_path.as_posix()).metadata.num_rows
+        for chunk_path in chunk_paths
+    )
+
   def match_window_ids(
       self,
       deployments_filter: config_dict.ConfigDict | None = None,
@@ -1665,32 +2048,47 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       start_times: Sequence[float],
       end_times: Sequence[float],
       scores: np.ndarray,
-      handle_existing: Literal['error', 'overwrite'] = 'error',
+      handle_existing_recordings: Literal['error', 'skip', 'overwrite'] = (
+          'error'
+      ),
   ) -> None:
-    """Write a deployment's *entire* class-score matrix in one bulk write.
+    """Write class scores for a batch of a deployment's windows.
 
     This is the only way to write scores in `ParquetScoresDB`: there is no
     per-row/per-window insertion, since Parquet is not designed for
-    single-row appends (see PARQUET_DUCKDB_PLAN.md, Q2). Typically called
-    once per deployment, after a single inference pass has produced scores
-    for every scored clip in that deployment.
+    single-row appends (see PARQUET_DUCKDB_PLAN.md, Q2). May be called once
+    per deployment (after a single inference pass has produced scores for
+    every scored clip in the deployment), or multiple times with disjoint
+    recordings (e.g. to bound peak memory on a very large deployment, or a
+    memory-constrained machine) -- a deployment's scores end up spread
+    across one or more Parquet "chunk" files, transparently unioned by
+    every read method (`select_scores`, `get_scores_batch`,
+    `add_detections_from_threshold`, ...).
 
-    IMPORTANT -- this is a **whole-file replacement**, not an upsert or an
-    append. A deployment has exactly one score Parquet file
-    (`deployment_parquet_path(deployment_id)`), and every call to this
-    method (with `handle_existing='overwrite'`) writes that entire file
-    from scratch out of the `recording_ids`/`start_times`/`end_times`/
-    `scores` you pass in. There is no merging with whatever rows the file
-    already contained: if a previous call wrote scores for windows A and B,
-    and this call only passes window A, window B's scores are gone after
-    this call returns -- they are not preserved, appended to, or unioned
-    with the new batch. If you need the union of two batches, pass all of
-    the rows (old and new) in a single call, or the union of the
-    `recording_ids`/`start_times`/`end_times`/`scores` you've collected so
-    far, from Python, before calling this. The write itself is atomic (via
-    a temp file and rename), so a reader will only ever see the fully-old
-    or fully-new file, never a partial one -- but "new" here always means
-    "exactly what this call passed in," not "old plus this call's rows."
+    IMPORTANT -- within one call, this always writes exactly one *new* chunk
+    file containing exactly the `recording_ids`/`start_times`/`end_times`/
+    `scores` you pass in (minus anything dropped by
+    `handle_existing_recordings='skip'`, or updated in place by
+    `'overwrite'` -- see below). It never appends to or merges into a chunk
+    file written by an earlier call. If you need the union of two batches of
+    *new* (never-before-scored) recordings in one chunk file, pass all of
+    the rows in a single call; otherwise, just call this once per batch --
+    each call's rows land in their own chunk, and all chunks are queried
+    together automatically. The write itself is atomic per chunk (via a temp
+    file and rename), so a reader will only ever see a fully-old or
+    fully-new version of any one chunk file, never a partial one.
+
+    `handle_existing_recordings` controls what happens when the batch
+    includes a recording that some earlier call already wrote scores for.
+    This check (and the `'skip'`/`'overwrite'` actions it can take) is keyed
+    **per recording**, never per score row: a recording's scores are always
+    written together by whichever call first wrote them, so there is no
+    partial state where only some of a recording's windows have been
+    scored. For example, with `handle_existing_recordings='overwrite'`, if
+    the incoming batch contains any rows for recording 1, *every* existing
+    row for recording 1 (all of its start/end-time windows, in whichever
+    chunk file they currently live) is replaced by recording 1's rows in
+    this batch -- this is not a row-by-row diff/merge.
 
     Args:
       deployment_id: The deployment these scores belong to. All
@@ -1700,16 +2098,32 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       end_times: The end offset (seconds) for each scored window.
       scores: A `[len(recording_ids), len(classes)]` array of
         per-class scores, in the same column order as `classes`.
-      handle_existing: If `'error'` (the default), raises if this deployment
-        already has a Parquet file. If `'overwrite'`, the existing file is
-        replaced outright with exactly the rows passed to this call (see
-        above -- this is not a merge).
+      handle_existing_recordings: How to handle a recording in the batch
+        that already has scores from an earlier call. If `'error'` (the
+        default), raises before writing anything if *any* recording in the
+        batch already has scores. If `'skip'`, recordings that already have
+        scores are dropped from the batch before writing; only
+        never-before-scored recordings are written to a new chunk (if the
+        filtered batch ends up empty, nothing is written at all). If
+        `'overwrite'`, already-scored recordings' rows are updated in place
+        within their existing chunk file(s) -- their `score_chunk_path`
+        does not change -- and only the batch's genuinely-new recordings (if
+        any) are written to a new chunk. `'overwrite'`'s cost is bounded by
+        how fragmented the affected recordings' existing chunks are, not by
+        the size of this batch, since every affected old chunk file must be
+        read back and rewritten.
 
     Raises:
-      ValueError: If input lengths/shapes are inconsistent, or if the
-        deployment already has a Parquet file and `handle_existing` is
-        `'error'`.
+      ValueError: If input lengths/shapes are inconsistent, or if any
+        recording in the batch already has scores and
+        `handle_existing_recordings` is `'error'`.
     """
+    if not handle_existing_recordings in ('error', 'skip', 'overwrite'):
+      raise ValueError(
+          f'`handle_existing_recordings` must be one of'
+          f" 'error', 'skip', or 'overwrite', but got"
+          f" {handle_existing_recordings!r}."
+      )
     deployment_id = int(deployment_id)
     class_labels = self.classes
     n = len(recording_ids)
@@ -1724,15 +2138,58 @@ class ParquetScoresDB(interface.HopliteDBInterface):
           f' `recording_ids` and `classes`, but got'
           f' {scores.shape}.'
       )
+    scores = np.asarray(scores, dtype=np.float16)
 
-    parquet_path = self.deployment_parquet_path(deployment_id)
-    if parquet_path.exists() and handle_existing == 'error':
+    recording_ids_arr = np.asarray(recording_ids, dtype=np.int64)
+    unique_recording_ids = sorted(set(recording_ids_arr.tolist()))
+    placeholders = ', '.join(['?'] * len(unique_recording_ids))
+    existing_chunk_by_recording = dict(
+        self.db.execute(
+            'SELECT id, score_chunk_path FROM recordings'
+            f' WHERE id IN ({placeholders}) AND score_chunk_path IS NOT NULL',
+            unique_recording_ids,
+        ).fetchall()
+    ) if unique_recording_ids else {}
+
+    if existing_chunk_by_recording and handle_existing_recordings == 'error':
       raise ValueError(
-          f'Deployment {deployment_id} already has a score Parquet file at'
-          f' {parquet_path}. Pass handle_existing="overwrite" to replace it.'
+          'The following recordings already have scores written:'
+          f' {sorted(existing_chunk_by_recording)}. Pass'
+          " handle_existing_recordings='skip' to skip them, or"
+          " ='overwrite' to replace their scores in place."
       )
 
-    scores = np.asarray(scores, dtype=np.float16)
+    if existing_chunk_by_recording and handle_existing_recordings == (
+        'overwrite'
+    ):
+      overwrite_mask = np.isin(
+          recording_ids_arr, list(existing_chunk_by_recording)
+      )
+      self._overwrite_recordings_in_place(
+          existing_chunk_by_recording,
+          class_labels,
+          recording_ids=recording_ids_arr[overwrite_mask],
+          start_times=np.asarray(start_times)[overwrite_mask],
+          end_times=np.asarray(end_times)[overwrite_mask],
+          scores=scores[overwrite_mask],
+      )
+
+    if existing_chunk_by_recording:
+      # Both 'skip' and 'overwrite' exclude already-scored recordings from
+      # the new chunk written below -- 'skip' drops them outright, and
+      # 'overwrite' has already updated them in their existing chunk(s).
+      keep_mask = ~np.isin(
+          recording_ids_arr, list(existing_chunk_by_recording)
+      )
+      recording_ids = recording_ids_arr[keep_mask]
+      start_times = np.asarray(start_times)[keep_mask]
+      end_times = np.asarray(end_times)[keep_mask]
+      scores = scores[keep_mask]
+
+    if len(recording_ids) == 0:  # pylint: disable=g-explicit-length-test
+      return
+
+    chunk_path = self._next_chunk_path(deployment_id)
     table = _build_scores_arrow_table(
         recording_ids, start_times, end_times, scores, class_labels
     )
@@ -1744,9 +2201,88 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     import pyarrow.parquet as pq  # pylint: disable=g-import-not-at-top
 
     self.scores_dir.mkdir(parents=True, exist_ok=True)  # pyrefly: ignore[unsupported-operation]
-    tmp_path = parquet_path.with_suffix('.parquet.tmp')
+    tmp_path = chunk_path.with_suffix('.parquet.tmp')
     pq.write_table(table, tmp_path.as_posix())
-    tmp_path.replace(parquet_path)
+    tmp_path.replace(chunk_path)
+
+    # Update `recordings` only after the chunk file is durably in place --
+    # a crash between the rename above and this update leaves an
+    # orphaned-but-harmless chunk file, never a `recordings` row pointing at
+    # a chunk file that doesn't exist (see PARQUET_DUCKDB_PLAN.md, Q9).
+    new_recording_ids = [int(r) for r in recording_ids]
+    placeholders = ', '.join(['?'] * len(new_recording_ids))
+    self.db.execute(
+        'UPDATE recordings SET score_chunk_path = ?'
+        f' WHERE id IN ({placeholders})',
+        [chunk_path.as_posix(), *new_recording_ids],
+    )
+
+  def _overwrite_recordings_in_place(
+      self,
+      existing_chunk_by_recording: dict[int, str],
+      class_labels: Sequence[str],
+      recording_ids: np.ndarray,
+      start_times: np.ndarray,
+      end_times: np.ndarray,
+      scores: np.ndarray,
+  ) -> None:
+    """Update already-scored recordings' rows in place, chunk by chunk.
+
+    Helper for `insert_deployment_scores(handle_existing_recordings=
+    'overwrite')`. `recording_ids`/`start_times`/`end_times`/`scores` here
+    are already filtered down to just the rows belonging to recordings in
+    `existing_chunk_by_recording` (the caller does this filtering, since it
+    already has the full incoming batch in hand).
+
+    Cost is bounded by how fragmented the affected recordings' existing
+    chunks are, not by the size of the batch passed in here: every distinct
+    old chunk file referenced by `existing_chunk_by_recording` must be read
+    back in full and rewritten, regardless of how many of its rows are
+    actually being replaced.
+    """
+    import pyarrow as pa  # pylint: disable=g-import-not-at-top
+    import pyarrow.compute as pc  # pylint: disable=g-import-not-at-top
+    import pyarrow.parquet as pq  # pylint: disable=g-import-not-at-top
+
+    recording_ids = np.asarray(recording_ids)
+    chunk_to_recording_ids: dict[str, list[int]] = {}
+    for recording_id, chunk_path_str in existing_chunk_by_recording.items():
+      chunk_to_recording_ids.setdefault(chunk_path_str, []).append(
+          recording_id
+      )
+
+    for chunk_path_str, overwritten_ids in chunk_to_recording_ids.items():
+      chunk_path = epath.Path(chunk_path_str)
+      # NOTE(parquet_scores): read via pyarrow.parquet directly, not DuckDB's
+      # `read_parquet` -- DuckDB's Arrow *export* widens the on-disk
+      # half-float (float16) score columns to float32, which would make
+      # `remaining` and `new_rows_for_chunk` (built at float16 by
+      # `_build_scores_arrow_table`) schema-incompatible for
+      # `concat_tables` below. `pq.read_table` preserves float16 exactly, as
+      # written by `pq.write_table` -- see the matching NOTE in
+      # `insert_deployment_scores`.
+      full_table = pq.read_table(chunk_path.as_posix())
+      remaining = full_table.filter(
+          pc.invert(pc.is_in(full_table['recording_id'], pa.array(overwritten_ids)))
+      )
+
+      chunk_mask = np.isin(recording_ids, overwritten_ids)
+      new_rows_for_chunk = _build_scores_arrow_table(
+          recording_ids[chunk_mask],
+          start_times[chunk_mask],
+          end_times[chunk_mask],
+          scores[chunk_mask],
+          class_labels,
+      )
+      # NOTE: `class_labels` (and therefore column order/schema) is fixed
+      # for the database's lifetime (PARQUET_DUCKDB_PLAN.md, Q5/Q8), so
+      # `remaining` and `new_rows_for_chunk` always share the same schema
+      # and `concat_tables` needs no schema unification.
+      updated_table = pa.concat_tables([remaining, new_rows_for_chunk])
+
+      tmp_path = chunk_path.with_suffix('.parquet.tmp')
+      pq.write_table(updated_table, tmp_path.as_posix())
+      tmp_path.replace(chunk_path)
 
   def _class_column(self, class_name: str) -> str:
     """Validate a class name and return a safe, quoted SQL column reference.
@@ -1784,20 +2320,21 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     Args:
       class_name: The class to fetch scores for. Must be one of
         `classes`.
-      deployment_ids: The deployments to scan. Any deployment with no
-        Parquet file yet (no scores written) is silently skipped.
+      deployment_ids: The deployments to scan. Any deployment with no score
+        chunk files yet (no scores written) is silently skipped.
 
     Returns:
       A SQL query string with columns `deployment_id`, `recording_id`,
       `start_time`, `end_time`, `score`, or `None` if no deployment in
-      `deployment_ids` has a Parquet file.
+      `deployment_ids` has any score chunk files.
     """
     class_column = self._class_column(class_name)
     branches = []
     for deployment_id in deployment_ids:
-      parquet_path = self.deployment_parquet_path(deployment_id)
-      if not parquet_path.exists():
+      chunk_paths = self._deployment_chunk_paths(deployment_id)
+      if not chunk_paths:
         continue
+      paths_str = ', '.join(f"'{p.as_posix()}'" for p in chunk_paths)
       branches.append(f"""
           SELECT
               {int(deployment_id)} AS deployment_id,
@@ -1805,7 +2342,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
               start_time,
               end_time,
               {class_column} AS score
-          FROM read_parquet('{parquet_path.as_posix()}')
+          FROM read_parquet([{paths_str}])
           """)
     if not branches:
       return None
@@ -1824,13 +2361,13 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     does not need one query per class.
 
     Args:
-      deployment_ids: The deployments to scan. Any deployment with no
-        Parquet file yet (no scores written) is silently skipped.
+      deployment_ids: The deployments to scan. Any deployment with no score
+        chunk files yet (no scores written) is silently skipped.
 
     Returns:
       A SQL query string with columns `deployment_id`, `recording_id`,
       `start_time`, `end_time`, `class_name`, `score`, or `None` if no
-      deployment in `deployment_ids` has a Parquet file.
+      deployment in `deployment_ids` has any score chunk files.
     """
     class_labels = self.classes
     class_columns_str = ', '.join(
@@ -1838,9 +2375,10 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     )
     branches = []
     for deployment_id in deployment_ids:
-      parquet_path = self.deployment_parquet_path(deployment_id)
-      if not parquet_path.exists():
+      chunk_paths = self._deployment_chunk_paths(deployment_id)
+      if not chunk_paths:
         continue
+      paths_str = ', '.join(f"'{p.as_posix()}'" for p in chunk_paths)
       branches.append(f"""
           SELECT
               {int(deployment_id)} AS deployment_id,
@@ -1849,8 +2387,92 @@ class ParquetScoresDB(interface.HopliteDBInterface):
               end_time,
               class_name,
               score
-          FROM read_parquet('{parquet_path.as_posix()}')
+          FROM read_parquet([{paths_str}])
           UNPIVOT (score FOR class_name IN ({class_columns_str}))
+          """)
+    if not branches:
+      return None
+    return ' UNION ALL '.join(branches)
+
+  def _windows_union_query(
+      self,
+      deployment_ids: Sequence[int],
+  ) -> str | None:
+    """Build a `UNION ALL` query over per-deployment Parquet scans, key columns only.
+
+    Unlike `_scores_union_query()`/`_scores_union_query_all_classes()`, this
+    projects no score/class column at all -- just the columns that identify
+    a window -- so counting windows (e.g. `sampling_effort()`) never reads
+    or unpivots any class-score data, regardless of how many classes are in
+    the vocabulary.
+
+    Args:
+      deployment_ids: The deployments to scan. Any deployment with no score
+        chunk files yet (no scores written) is silently skipped.
+
+    Returns:
+      A SQL query string with columns `deployment_id`, `recording_id`,
+      `start_time`, `end_time`, or `None` if no deployment in
+      `deployment_ids` has any score chunk files.
+    """
+    branches = []
+    for deployment_id in deployment_ids:
+      chunk_paths = self._deployment_chunk_paths(deployment_id)
+      if not chunk_paths:
+        continue
+      paths_str = ', '.join(f"'{p.as_posix()}'" for p in chunk_paths)
+      branches.append(f"""
+          SELECT
+              {int(deployment_id)} AS deployment_id,
+              recording_id,
+              start_time,
+              end_time
+          FROM read_parquet([{paths_str}])
+          """)
+    if not branches:
+      return None
+    return ' UNION ALL '.join(branches)
+
+  def _wide_scores_union_query(
+      self,
+      deployment_ids: Sequence[int],
+  ) -> str | None:
+    """Build a `UNION ALL` query over per-deployment Parquet scans, all class columns wide.
+
+    Unlike `_scores_union_query_all_classes()`, this does not `UNPIVOT` --
+    each window stays one row, with every class as its own column -- so a
+    caller wanting the full score vector per window (e.g. `get_scores()`)
+    gets back something directly reshapable into a `[n_windows, n_classes]`
+    array, not one row per `(window, class)` pair.
+
+    Args:
+      deployment_ids: The deployments to scan. Any deployment with no score
+        chunk files yet (no scores written) is silently skipped.
+
+    Returns:
+      A SQL query string with columns `deployment_id`, `recording_id`,
+      `start_time`, `end_time`, plus one column per class (see `classes`),
+      or `None` if no deployment in `deployment_ids` has any score chunk
+      files.
+    """
+    class_labels = self.classes
+    class_columns_str = ', '.join(
+        quote_sql_identifier(c) for c in class_labels
+    )
+    branches = []
+    for deployment_id in deployment_ids:
+      chunk_paths = self._deployment_chunk_paths(deployment_id)
+      if not chunk_paths:
+        continue
+      paths_str = ', '.join(f"'{p.as_posix()}'" for p in chunk_paths)
+      branches.append(f"""
+          SELECT
+              {int(deployment_id)} AS deployment_id,
+              recording_id,
+              start_time,
+              end_time,
+              {class_columns_str}
+          FROM read_parquet([{paths_str}])
           """)
     if not branches:
       return None
@@ -1902,29 +2524,58 @@ class ParquetScoresDB(interface.HopliteDBInterface):
 
   def _build_stratum_expr(
       self,
-      by_deployment: bool,
+      by_deployment_fields: Sequence[str],
       date_bins: Any,
       date_bin_expr: str,
       deployment_id_column: str = 'scores.deployment_id',
   ) -> str:
-    """Build the stratum SQL expression by composing the two strata axes.
+    """Build the stratum SQL expression by composing the strata axes.
 
     Shared by `select_scores()` and `select_detections()`.
+
+    Args:
+      by_deployment_fields: `deployments` column names to stratify by (e.g.
+        `['id']` for the plain by-deployment case, or `['project',
+        'management_unit']` to stratify by those `deployments` fields
+        instead of/in addition to deployment identity). Empty if not
+        stratifying by any deployment field.
+      date_bins: Same as `select_scores()`'s `date_bins` argument (only
+        used here to decide whether a `'date_bin'` key is also folded into
+        the stratum).
+      date_bin_expr: The date-bin SQL expression, from
+        `_build_date_bin_clause()`.
+      deployment_id_column: The (already-qualified) column referencing a
+        row's deployment id -- substituted for the `'id'` field specifically
+        (rather than re-referencing `deployments.id`), since callers already
+        have this column available and it means the same thing.
+
+    Returns:
+      A SQL expression: a bare column reference if exactly one axis is
+      active (one deployment field, xor one date bin, and nothing else), a
+      `MAP`-literal-style dict if more than one axis is active, or the
+      constant `0` if stratifying by nothing at all.
     """
-    if by_deployment and date_bins is not None:
-      return (
-          "{'deployment_id': "
-          + deployment_id_column
-          + ", 'date_bin': "
-          + date_bin_expr
-          + '}'
-      )
-    elif by_deployment:
-      return deployment_id_column
-    elif date_bins is not None:
-      return date_bin_expr
-    else:
+    # `'id'`'s stratum key stays `'deployment_id'` (not `'id'`) for backwards
+    # compatibility with the plain `by_deployment=True` case, which this
+    # generalizes -- existing callers inspecting `stratum['deployment_id']`
+    # must keep working unchanged.
+    axes = {
+        ('deployment_id' if field == 'id' else field): (
+            deployment_id_column
+            if field == 'id'
+            else f'deployments.{quote_sql_identifier(field)}'
+        )
+        for field in by_deployment_fields
+    }
+    if date_bins is not None:
+      axes['date_bin'] = date_bin_expr
+
+    if not axes:
       return '0'
+    if len(axes) == 1:
+      return next(iter(axes.values()))
+    entries = ', '.join(f"'{key}': {expr}" for key, expr in axes.items())
+    return '{' + entries + '}'
 
   def _build_random_select_clause(
       self,
@@ -1965,6 +2616,44 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       random_select = ', random() AS random_key'
     return order_expr, random_select
 
+  def _normalize_by_deployment_fields(
+      self,
+      by_deployment: bool,
+      by_deployment_fields: Sequence[str] | None,
+  ) -> tuple[str, ...]:
+    """Reconcile `by_deployment` (legacy) with `by_deployment_fields`.
+
+    Shared by `select_scores()` and `select_detections()`. `by_deployment`
+    is kept as a convenience boolean, equivalent to
+    `by_deployment_fields=['id']`; passing both is rejected rather than
+    silently picking one, since there's no obviously-correct way to combine
+    a legacy flag with the field it's shorthand for.
+
+    Args:
+      by_deployment: The legacy boolean flag.
+      by_deployment_fields: `deployments` column names to stratify by, or
+        `None` for none.
+
+    Returns:
+      A tuple of `deployments` column names to stratify by (possibly
+      empty), validated against the table's actual columns.
+
+    Raises:
+      ValueError: If both `by_deployment` and `by_deployment_fields` are
+        given, or if `by_deployment_fields` names an unknown column.
+    """
+    if by_deployment and by_deployment_fields:
+      raise ValueError(
+          'Pass only one of `by_deployment` (shorthand for'
+          " `by_deployment_fields=['id']`) or `by_deployment_fields`, not"
+          ' both.'
+      )
+    fields = tuple(by_deployment_fields) if by_deployment_fields else (
+        ('id',) if by_deployment else ()
+    )
+    self._validate_columns('deployments', fields)
+    return fields
+
   def select_scores(
       self,
       class_name: str,
@@ -1972,6 +2661,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       n: int | None = None,
       bin_edges: Sequence[float] | None = None,
       by_deployment: bool = False,
+      by_deployment_fields: Sequence[str] | None = None,
       date_bins: Literal['day', 'week']
       | Sequence[tuple[dt.datetime, str]]
       | None = None,
@@ -1987,9 +2677,10 @@ class ParquetScoresDB(interface.HopliteDBInterface):
 
     This is the general-purpose scores-selection entry point: it composes a
     selection mode (highest-scoring, random, or percentile-binned) with
-    optional, independent stratification (by deployment, by date bin, or
-    both) and a set of filters, all evaluated in a single query over the
-    relevant deployments' Parquet files.
+    optional, independent stratification (by deployment, by arbitrary
+    `deployments` field(s), by date bin, or any combination) and a set of
+    filters, all evaluated in a single query over the relevant deployments'
+    Parquet files.
 
     Args:
       class_name: The class to select scores for. Must be one of
@@ -2009,15 +2700,26 @@ class ParquetScoresDB(interface.HopliteDBInterface):
         1]` for 4 bins. Required (and only used) when `selection='binned'`.
       by_deployment: If `True`, `selection` is applied independently within
         each deployment, rather than once across all matching rows.
-        Composes with `date_bins` (both can be set at once).
+        Shorthand for `by_deployment_fields=['id']`; passing both raises.
+        Composes with `date_bins` (all three can be set at once, modulo
+        picking only one of `by_deployment`/`by_deployment_fields`).
+      by_deployment_fields: If provided, `selection` is applied
+        independently within each distinct combination of values of these
+        `deployments` columns (built-in -- `id`, `name`, `project`,
+        `latitude`, `longitude` -- or extra, e.g. a caller-added
+        `management_unit` or `experimental_group` column). Each requested
+        field also becomes its own output column (see `Returns` below), not
+        just a `stratum` entry. `['id']` is equivalent to
+        `by_deployment=True`; pass at most one of the two. Composes with
+        `date_bins`.
       date_bins: If provided, `selection` is applied independently within
         each date bin. Either `'day'`/`'week'` (regular calendar buckets via
         `date_trunc`), or an explicit, caller-supplied sequence of
         `(bin_start, bin_label)` pairs (assigned via an as-of join, so each
         recording falls into the latest bin whose start is `<=` its
         `datetime`) -- each `bin_start` must be a timezone-aware datetime,
-        same as `start_date`/`end_date` below. Composes with `by_deployment`
-        (both can be set at once).
+        same as `start_date`/`end_date` below. Composes with `by_deployment`/
+        `by_deployment_fields`.
       deployments_filter: If provided, restricts to deployments matching
         these constraints. IMPORTANT: filter on the deployments table's own
         columns (`id`, `name`, `project`, `latitude`, `longitude`, or any
@@ -2045,10 +2747,14 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     Returns:
       A pandas DataFrame with columns `deployment_id`, `deployment_name`,
       `recording_id`, `recording_filename`, `recording_datetime`,
-      `start_time`, `end_time`, `score`, plus `stratum` (if `by_deployment`
-      and/or `date_bins` is used), `date_bin_label` (if `date_bins` is
-      used), and `bin_idx` (if `selection='binned'`). Row order is by
-      stratum/bin (if any), then by score descending.
+      `start_time`, `end_time`, `score`, plus one column per
+      `by_deployment_fields` entry other than `'id'` (named after the
+      field, e.g. a `project` column for `by_deployment_fields=['project']`
+      -- `'id'`/`by_deployment` don't add a column of their own, since
+      `deployment_id` already covers it), `stratum` (if stratifying by
+      anything at all), `date_bin_label` (if `date_bins` is used), and
+      `bin_idx` (if `selection='binned'`). Row order is by stratum/bin (if
+      any), then by score descending.
 
     Example:
       A single call exercising every parameter: for class `'crow'`, within
@@ -2086,6 +2792,21 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       # score, stratum (a dict: {'deployment_id': ..., 'date_bin': ...}),
       # date_bin_label, bin_idx.
       ```
+
+      Stratifying by an arbitrary `deployments` field instead of deployment
+      identity, e.g. a caller-added `management_unit` extra column:
+
+      ```python
+      result = db.select_scores(
+          class_name='crow',
+          selection='top',
+          n=5,
+          by_deployment_fields=['management_unit'],
+      )
+      # result columns include a `management_unit` column directly (not
+      # just inside `stratum`), so e.g. result.groupby('management_unit')
+      # works without unpacking `stratum` first.
+      ```
     """
     if n is None:
       raise ValueError('`n` is required.')
@@ -2096,7 +2817,10 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     if date_bins is not None and not isinstance(date_bins, str):
       for bin_start, _ in date_bins:
         require_timezone_aware(bin_start, 'date_bins')
-    stratify = by_deployment or date_bins is not None
+    deployment_fields = self._normalize_by_deployment_fields(
+        by_deployment, by_deployment_fields
+    )
+    stratify = bool(deployment_fields) or date_bins is not None
     # Validate the class name unconditionally (not just when a Parquet scan
     # actually happens), so an unknown class name is caught even when the
     # database has no deployments/scores yet.
@@ -2145,9 +2869,17 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     bucket_join, date_bin_expr = self._build_date_bin_clause(date_bins)
 
     # Build the stratum expression (or a constant, if not stratifying) by
-    # independently composing `by_deployment` and `date_bins`.
+    # independently composing `deployment_fields` and `date_bins`.
     stratum_expr = self._build_stratum_expr(
-        by_deployment, date_bins, date_bin_expr
+        deployment_fields, date_bins, date_bin_expr
+    )
+    # Fields other than `'id'` also become their own named output column
+    # (not just a `stratum` entry) -- `'id'` doesn't need one, since
+    # `deployment_id` already covers it.
+    named_fields = [f for f in deployment_fields if f != 'id']
+    field_columns_str = ''.join(
+        f', deployments.{quote_sql_identifier(f)} AS {quote_sql_identifier(f)}'
+        for f in named_fields
     )
 
     order_expr, random_select = self._build_random_select_clause(
@@ -2157,6 +2889,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     output_columns = [
         'deployment_id',
         'deployment_name',
+        *named_fields,
         'recording_id',
         'recording_filename',
         'recording_datetime',
@@ -2182,6 +2915,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
               scores.score AS score,
               {stratum_expr} AS stratum,
               {date_bin_expr} AS date_bin_label
+              {field_columns_str}
               {random_select}
           FROM ({union_query}) AS scores
           JOIN recordings ON scores.recording_id = recordings.id
@@ -2248,6 +2982,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       n: int | None = None,
       bin_edges: Sequence[float] | None = None,
       by_deployment: bool = False,
+      by_deployment_fields: Sequence[str] | None = None,
       date_bins: Literal['day', 'week']
       | Sequence[tuple[dt.datetime, str]]
       | None = None,
@@ -2264,10 +2999,11 @@ class ParquetScoresDB(interface.HopliteDBInterface):
 
     Composes a selection mode (highest-scoring, random, or
     percentile-binned) with optional, independent stratification (by
-    deployment, by date bin, or both) and a set of filters -- same shape as
-    `select_scores()`, but reading from the `detections` table (a normal,
-    small DuckDB table) rather than scanning per-deployment Parquet files,
-    since detections are already sparse and id-bearing.
+    deployment, by arbitrary `deployments` field(s), by date bin, or any
+    combination) and a set of filters -- same shape as `select_scores()`,
+    but reading from the `detections` table (a normal, small DuckDB table)
+    rather than scanning per-deployment Parquet files, since detections are
+    already sparse and id-bearing.
 
     Unlike `select_scores()`, `class_name` is optional: a detection already
     carries its own `class_name`, so omitting it selects across all classes
@@ -2286,10 +3022,17 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       bin_edges: Percentile bin edges in `[0, 1]`. Required (and only used)
         when `selection='binned'`.
       by_deployment: If `True`, `selection` is applied independently within
-        each deployment. Composes with `date_bins`.
+        each deployment. Shorthand for `by_deployment_fields=['id']`;
+        passing both raises. Composes with `date_bins`.
+      by_deployment_fields: Same as `select_scores()`'s
+        `by_deployment_fields` -- stratify by arbitrary `deployments`
+        column(s) instead of (or in addition to, via more than one field)
+        deployment identity, each also becoming its own output column. At
+        most one of `by_deployment`/`by_deployment_fields`. Composes with
+        `date_bins`.
       date_bins: If provided, `selection` is applied independently within
         each date bin -- same semantics as `select_scores()`'s `date_bins`.
-        Composes with `by_deployment`.
+        Composes with `by_deployment`/`by_deployment_fields`.
       deployments_filter: If provided, restricts to deployments matching
         these constraints. IMPORTANT: use the deployments table's own
         columns (`id`, `name`, `project`, `latitude`, `longitude`, or
@@ -2317,10 +3060,11 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       A pandas DataFrame with columns `detection_id`, `deployment_id`,
       `deployment_name`, `recording_id`, `recording_filename`,
       `recording_datetime`, `start_time`, `end_time`, `class_name`, `score`,
-      plus `stratum` (if `by_deployment` and/or `date_bins` is used),
-      `date_bin_label` (if `date_bins` is used), and `bin_idx` (if
-      `selection='binned'`). Row order is by stratum/bin (if any), then by
-      score descending.
+      plus one column per `by_deployment_fields` entry other than `'id'`
+      (see `select_scores()`'s `Returns` for details), `stratum` (if
+      stratifying by anything at all), `date_bin_label` (if `date_bins` is
+      used), and `bin_idx` (if `selection='binned'`). Row order is by
+      stratum/bin (if any), then by score descending.
 
     Example:
       A single call exercising every parameter: among detections for class
@@ -2380,7 +3124,10 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     self._validate_filter_columns('detections', filter)
     self._validate_filter_columns('recordings', recordings_filter)
     self._validate_filter_columns('deployments', deployments_filter)
-    stratify = by_deployment or date_bins is not None
+    deployment_fields = self._normalize_by_deployment_fields(
+        by_deployment, by_deployment_fields
+    )
+    stratify = bool(deployment_fields) or date_bins is not None
 
     conditions, values = format_sql_where_conditions(
         filter, table_prefix='detections'
@@ -2418,10 +3165,15 @@ class ParquetScoresDB(interface.HopliteDBInterface):
 
     bucket_join, date_bin_expr = self._build_date_bin_clause(date_bins)
     stratum_expr = self._build_stratum_expr(
-        by_deployment,
+        deployment_fields,
         date_bins,
         date_bin_expr,
         deployment_id_column='recordings.deployment_id',
+    )
+    named_fields = [f for f in deployment_fields if f != 'id']
+    field_columns_str = ''.join(
+        f', deployments.{quote_sql_identifier(f)} AS {quote_sql_identifier(f)}'
+        for f in named_fields
     )
     order_expr, random_select = self._build_random_select_clause(
         selection,
@@ -2433,6 +3185,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
         'detection_id',
         'deployment_id',
         'deployment_name',
+        *named_fields,
         'recording_id',
         'recording_filename',
         'recording_datetime',
@@ -2461,6 +3214,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
               detections.score AS score,
               {stratum_expr} AS stratum,
               {date_bin_expr} AS date_bin_label
+              {field_columns_str}
               {random_select}
           FROM detections
           JOIN recordings ON detections.recording_id = recordings.id
@@ -2520,6 +3274,288 @@ class ParquetScoresDB(interface.HopliteDBInterface):
 
     return result
 
+  def sampling_effort(
+      self,
+      by_deployment: bool = False,
+      date_bins: Literal['day', 'week']
+      | Sequence[tuple[dt.datetime, str]]
+      | None = None,
+      deployments_filter: config_dict.ConfigDict | None = None,
+      recordings_filter: config_dict.ConfigDict | None = None,
+      start_date: dt.datetime | None = None,
+      end_date: dt.datetime | None = None,
+  ) -> Any:
+    """Count scored windows per deployment x date stratum.
+
+    Mirrors `select_scores()`'s stratification/filter arguments
+    (`by_deployment`, `date_bins`, `deployments_filter`, `recordings_filter`,
+    `start_date`, `end_date`), but reports *how much data exists* (a window
+    count per stratum) rather than selecting score rows -- e.g. "how many
+    scored clips does each deployment have per week" to check for coverage
+    gaps, rather than "what are the highest scores per week."
+
+    Unlike `select_scores()`/`select_detections()`, every stratum in the
+    grid this method defines gets a row, even ones with zero windows: a
+    stratum that has no matching data is not silently absent, it is a row
+    with `n_windows=0`. The grid is built as follows:
+      - The deployment axis (only present if `by_deployment=True`) is every
+        deployment matching `deployments_filter`, independent of whether it
+        has any recordings or scores yet.
+      - The date-bin axis (only present if `date_bins` is not `None`)
+        depends on the kind of `date_bins`:
+          - An explicit `(bin_start, bin_label)` sequence defines its own
+            fixed set of bins, independent of the data.
+          - `'day'`/`'week'` (calendar truncation) has no such
+            data-independent universe, so the bin axis is instead the
+            *union*, across every deployment, of calendar bins touched by
+            any recording matching `recordings_filter`/`start_date`/
+            `end_date` -- e.g. with `date_bins='week'` and
+            `by_deployment=True`, if deployment B has a recording in week 3
+            but deployment A does not, deployment A still gets a
+            `(A, week 3)` row with `n_windows=0`, surfacing the coverage
+            gap. If no recording matches at all, there are no calendar bins
+            to report and the result is empty (there is no
+            data-independent notion of "which weeks exist").
+      - If both axes are active, the grid is their full cross product
+        (every matching deployment x every bin in the shared bin set). If
+        neither is active, the result is a single row (the filtered
+        database's total window count).
+
+    Args:
+      by_deployment: If `True`, stratify by deployment (see grid rules
+        above). Composes with `date_bins`.
+      date_bins: If provided, stratify by date bin -- see grid rules above
+        for how the bin set is determined. Composes with `by_deployment`.
+      deployments_filter: If provided, restricts the deployment axis (and
+        the windows counted) to deployments matching these constraints.
+        Use the deployments table's own columns (`id`, `name`, `project`,
+        `latitude`, `longitude`, or extras) -- e.g. `eq=dict(id=3)`, NOT
+        `eq=dict(deployment_id=3)` (see `select_scores()`'s docstring for
+        why this is an easy mistake).
+      recordings_filter: If provided, restricts the recordings (and
+        therefore windows) counted to recordings matching these constraints
+        (columns: `id`, `filename`, `datetime`, `deployment_id`, or
+        extras).
+      start_date: If provided, only recordings with `datetime >=
+        start_date` are counted. Must be timezone-aware; a naive datetime
+        is rejected.
+      end_date: If provided, only recordings with `datetime <= end_date`
+        are counted. Must be timezone-aware; a naive datetime is rejected.
+
+    Returns:
+      A pandas DataFrame with columns `n_windows`, plus `deployment_id` and
+      `deployment_name` (if `by_deployment`), plus `date_bin_label` (if
+      `date_bins` is set). One row per stratum in the grid described above,
+      including strata with `n_windows=0`.
+
+    Example:
+      Windows per `(deployment, week)`, restricted to one project and a
+      date range, to spot coverage gaps:
+
+      ```python
+      import datetime as dt
+      from ml_collections import config_dict
+
+      result = db.sampling_effort(
+          by_deployment=True,
+          date_bins='week',
+          deployments_filter=config_dict.create(
+              eq=dict(project='my_project'),
+          ),
+          start_date=dt.datetime(2024, 6, 1, tzinfo=dt.timezone.utc),
+          end_date=dt.datetime(2024, 9, 1, tzinfo=dt.timezone.utc),
+      )
+      # result columns: deployment_id, deployment_name, date_bin_label,
+      # n_windows. One row per (deployment, week actually present in the
+      # filtered data) -- including (deployment, week) pairs with
+      # n_windows=0 if that deployment had no recordings that week but
+      # some other matching deployment did.
+      ```
+    """
+    require_timezone_aware(start_date, 'start_date')
+    require_timezone_aware(end_date, 'end_date')
+    if date_bins is not None and not isinstance(date_bins, str):
+      for bin_start, _ in date_bins:
+        require_timezone_aware(bin_start, 'date_bins')
+    self._validate_filter_columns('recordings', recordings_filter)
+
+    if deployments_filter is not None:
+      deployments = self.get_all_deployments(filter=deployments_filter)
+    else:
+      deployments = self.get_all_deployments()
+    deployment_ids = [d.id for d in deployments]
+    if by_deployment and not deployments:
+      return _empty_sampling_effort_frame(by_deployment, date_bins)
+
+    # Recordings-side filter (metadata filter + date range + the
+    # deployments_filter-scoped deployment set, if stratifying by
+    # deployment), shared by the bin-set query and the window-count query
+    # below.
+    conditions, values = format_sql_where_conditions(
+        recordings_filter, table_prefix='recordings'
+    )
+    date_conditions = []
+    if start_date is not None:
+      date_conditions.append('recordings.datetime >= ?')
+      values.append(start_date)
+    if end_date is not None:
+      date_conditions.append('recordings.datetime <= ?')
+      values.append(end_date)
+    if by_deployment:
+      # Scope counted recordings to the (already deployments_filter-scoped)
+      # deployment set, so e.g. a deployments_filter restricting to one
+      # project doesn't pull in other projects' recordings when computing
+      # the shared calendar bin set below.
+      placeholders = ', '.join(['?'] * len(deployment_ids)) or 'NULL'
+      date_conditions.append(f'recordings.deployment_id IN ({placeholders})')
+      values.extend(deployment_ids)
+    all_conditions = [c for c in [conditions] + date_conditions if c]
+    where_clause = (
+        f"WHERE {' AND '.join(all_conditions)}" if all_conditions else ''
+    )
+    recordings_values = values
+
+    try:
+      bucket_join, date_bin_expr = self._build_date_bin_clause(date_bins)
+
+      # Build the bin axis, if stratifying by date. See the docstring for
+      # why calendar bins ('day'/'week') and an explicit bin list have
+      # different universes.
+      bin_labels = None
+      if date_bins is not None:
+        if isinstance(date_bins, str):
+          bin_rows = self.db.execute(
+              f"""
+              SELECT DISTINCT {date_bin_expr} AS date_bin_label
+              FROM recordings
+              {bucket_join}
+              {where_clause}
+              """,
+              recordings_values,
+          ).fetchall()
+          bin_labels = [r[0] for r in bin_rows if r[0] is not None]
+        else:
+          bin_labels = [label for _, label in date_bins]
+        if not bin_labels:
+          return _empty_sampling_effort_frame(by_deployment, date_bins)
+
+      # Build the grid as a temp table with exactly the active axis
+      # columns, independent of whether any scores/windows actually exist
+      # for a given combination -- that's the whole point, see the
+      # docstring. `by_deployment` and `date_bins` are each optional, so the
+      # grid is the cross product of whichever axes are active: a list of
+      # per-row dicts for the deployment axis (one dict per deployment, or a
+      # single empty dict if not stratifying by deployment) crossed with a
+      # list of per-row dicts for the date-bin axis (one per bin, or a
+      # single empty dict if not stratifying by date), merging the two dicts
+      # for every combination.
+      self.db.execute('DROP TABLE IF EXISTS _sampling_effort_grid')
+      grid_columns = []
+      if by_deployment:
+        grid_columns += ['deployment_id INTEGER', 'deployment_name VARCHAR']
+      if date_bins is not None:
+        grid_columns.append('date_bin_label VARCHAR')
+      column_names = [c.split(' ')[0] for c in grid_columns]
+      self.db.execute(
+          'CREATE TEMP TABLE _sampling_effort_grid'
+          f" ({', '.join(grid_columns) if grid_columns else 'placeholder INTEGER'})"
+      )
+
+      deployment_axis_rows = (
+          [{'deployment_id': d.id, 'deployment_name': d.name} for d in deployments]
+          if by_deployment
+          else [{}]
+      )
+      date_bin_axis_rows = (
+          [{'date_bin_label': label} for label in bin_labels]
+          if date_bins is not None
+          else [{}]
+      )
+      grid_rows = [
+          tuple((dep_row | bin_row)[c] for c in column_names)
+          for dep_row in deployment_axis_rows
+          for bin_row in date_bin_axis_rows
+      ] if column_names else [(1,)]
+      placeholders_str = ', '.join(['?'] * max(len(grid_columns), 1))
+      self.db.executemany(
+          f'INSERT INTO _sampling_effort_grid VALUES ({placeholders_str})',
+          grid_rows,
+      )
+
+      # Count actual windows per (deployment, date bin) touched by any
+      # score chunk file, using the same recordings-side filter as the grid.
+      union_query = self._windows_union_query(deployment_ids)
+      count_select = ['COUNT(*) AS n_windows']
+      count_group_by = []
+      if by_deployment:
+        count_select.append('scores.deployment_id AS deployment_id')
+        count_group_by.append('scores.deployment_id')
+      if date_bins is not None:
+        count_select.append(f'{date_bin_expr} AS date_bin_label')
+        count_group_by.append(date_bin_expr)
+      group_by_clause = (
+          f"GROUP BY {', '.join(count_group_by)}" if count_group_by else ''
+      )
+      if union_query is not None:
+        counts_query = f"""
+            SELECT {', '.join(count_select)}
+            FROM ({union_query}) AS scores
+            JOIN recordings ON scores.recording_id = recordings.id
+            {bucket_join}
+            {where_clause}
+            {group_by_clause}
+            """
+        counts_values = recordings_values
+      else:
+        # No deployment in scope has any score chunk files at all -- select
+        # zero rows, but with the right output column names/types (no
+        # `scores` table exists in this branch to alias them from).
+        empty_select = ['CAST(NULL AS BIGINT) AS n_windows']
+        if by_deployment:
+          empty_select.append('CAST(NULL AS INTEGER) AS deployment_id')
+        if date_bins is not None:
+          empty_select.append('CAST(NULL AS VARCHAR) AS date_bin_label')
+        counts_query = f"SELECT {', '.join(empty_select)} WHERE FALSE"
+        counts_values = []
+
+      join_conditions = []
+      if by_deployment:
+        join_conditions.append('grid.deployment_id = counts.deployment_id')
+      if date_bins is not None:
+        join_conditions.append('grid.date_bin_label = counts.date_bin_label')
+      join_clause = (
+          f"ON {' AND '.join(join_conditions)}"
+          if join_conditions
+          else 'ON TRUE'
+      )
+
+      output_columns = []
+      if by_deployment:
+        output_columns += ['grid.deployment_id AS deployment_id',
+                            'grid.deployment_name AS deployment_name']
+      if date_bins is not None:
+        output_columns.append('grid.date_bin_label AS date_bin_label')
+      output_columns.append('COALESCE(counts.n_windows, 0) AS n_windows')
+      order_by_clause = (
+          f"ORDER BY {', '.join(c.split(' AS ')[1] for c in output_columns[:-1])}"
+          if output_columns[:-1]
+          else ''
+      )
+
+      final_query = f"""
+          SELECT {', '.join(output_columns)}
+          FROM _sampling_effort_grid AS grid
+          LEFT JOIN ({counts_query}) AS counts
+          {join_clause}
+          {order_by_clause}
+          """
+      result = self.db.execute(final_query, counts_values).fetchdf()
+    finally:
+      self.db.execute('DROP TABLE IF EXISTS _select_scores_buckets')
+      self.db.execute('DROP TABLE IF EXISTS _sampling_effort_grid')
+
+    return result
+
   def get_scores_batch(
       self,
       deployment_id: int,
@@ -2530,8 +3566,8 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     """Get the full class-score vector for a batch of specific windows.
 
     Args:
-      deployment_id: The deployment whose Parquet file to read from. All
-        requested windows must belong to this deployment.
+      deployment_id: The deployment whose score chunk file(s) to read from.
+        All requested windows must belong to this deployment.
       recording_ids: The recording id for each requested window.
       start_times: The start offset (seconds) for each requested window.
       end_times: The end offset (seconds) for each requested window.
@@ -2543,7 +3579,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
 
     Raises:
       KeyError: If any requested `(recording_id, start_time, end_time)` key
-        is not found in the deployment's Parquet file.
+        is not found in any of the deployment's score chunk files.
     """
     deployment_id = int(deployment_id)
     class_labels = self.classes
@@ -2554,10 +3590,23 @@ class ParquetScoresDB(interface.HopliteDBInterface):
           f' same length (got {n}, {len(start_times)}, {len(end_times)}).'
       )
 
-    parquet_path = self.deployment_parquet_path(deployment_id)
-    if not parquet_path.exists():
+    # Resolve only the chunk files that actually contain a requested
+    # recording, rather than every chunk file in the deployment -- a real
+    # pruning win when the request is scoped to a handful of recordings out
+    # of a much larger deployment (see PARQUET_DUCKDB_PLAN.md, Q9).
+    unique_recording_ids = sorted(set(int(r) for r in recording_ids))
+    placeholders = ', '.join(['?'] * len(unique_recording_ids))
+    relevant_chunk_rows = self.db.execute(
+        'SELECT DISTINCT score_chunk_path FROM recordings'
+        f' WHERE id IN ({placeholders}) AND deployment_id = ?'
+        ' AND score_chunk_path IS NOT NULL',
+        [*unique_recording_ids, deployment_id],
+    ).fetchall()
+    chunk_paths = [row[0] for row in relevant_chunk_rows]
+    if not chunk_paths:
       raise KeyError(
-          f'No score Parquet file found for deployment {deployment_id}.'
+          'No score chunk files found for deployment'
+          f' {deployment_id} covering the requested recordings.'
       )
 
     keys_table = self.db.from_arrow(
@@ -2568,16 +3617,17 @@ class ParquetScoresDB(interface.HopliteDBInterface):
       class_columns_str = ', '.join(
           f'scores.{quote_sql_identifier(c)}' for c in class_labels
       )
+      paths_str = ', '.join(f"'{p}'" for p in chunk_paths)
       query = f"""
           SELECT keys._req_idx, {class_columns_str}
           FROM _score_keys AS keys
-          LEFT JOIN read_parquet(?) AS scores
+          LEFT JOIN read_parquet([{paths_str}]) AS scores
           ON keys.recording_id = scores.recording_id
           AND ABS(keys.start_time - scores.start_time) < 1e-6
           AND ABS(keys.end_time - scores.end_time) < 1e-6
           ORDER BY keys._req_idx
           """
-      rows = self.db.execute(query, [parquet_path.as_posix()]).fetchall()
+      rows = self.db.execute(query).fetchall()
     finally:
       self.db.execute('DROP TABLE IF EXISTS _score_keys')
 
@@ -2596,6 +3646,143 @@ class ParquetScoresDB(interface.HopliteDBInterface):
           f' (0-indexed into the input batch): {missing}.'
       )
     return result
+
+  def get_scores(
+      self,
+      deployments_filter: config_dict.ConfigDict | None = None,
+      recordings_filter: config_dict.ConfigDict | None = None,
+      start_date: dt.datetime | None = None,
+      end_date: dt.datetime | None = None,
+  ) -> ScoreBatch:
+    """Get all scored windows matching a filter, as a `ScoreBatch`.
+
+    The columnar (struct-of-arrays), filtered-scan analog of
+    `SQLiteUSearchDB.get_all_windows()`, adapted to this backend's wide,
+    per-deployment-Parquet score storage: rather than a list of per-window
+    objects, this returns one `ScoreBatch` -- parallel `deployment_ids`/
+    `recording_ids`/`start_times`/`end_times` arrays plus a single `[N,
+    n_classes]` `scores` array -- matching the shape
+    `insert_deployment_scores()`/`get_scores_batch()` already use elsewhere
+    in this class. With no arguments, returns every scored window in the
+    database; each filter narrows the scan.
+
+    Args:
+      deployments_filter: If provided, restricts to deployments matching
+        these constraints. Use the deployments table's own columns (`id`,
+        `name`, `project`, `latitude`, `longitude`, or extras) -- e.g.
+        `eq=dict(name='site_1')`, NOT `eq=dict(deployment_id='site_1')` (see
+        `select_scores()`'s docstring for why this is an easy mistake).
+      recordings_filter: If provided, restricts to recordings matching
+        these constraints (columns: `id`, `filename`, `datetime`,
+        `deployment_id`, or extras).
+      start_date: If provided, only recordings with `datetime >=
+        start_date`. Must be timezone-aware; a naive datetime is rejected.
+      end_date: If provided, only recordings with `datetime <= end_date`.
+        Must be timezone-aware; a naive datetime is rejected.
+
+    Returns:
+      A `ScoreBatch` with one entry per matching window (empty arrays, not
+      an error, if nothing matches).
+
+    Example:
+      Scores for a specific list of deployments, by name:
+
+      ```python
+      from ml_collections import config_dict
+
+      batch = db.get_scores(
+          deployments_filter=config_dict.create(
+              isin=dict(name=['site_1', 'site_2', 'site_7'])
+          ),
+      )
+      ```
+
+      Scores for a specific list of recordings, by filename:
+
+      ```python
+      batch = db.get_scores(
+          recordings_filter=config_dict.create(
+              isin=dict(filename=['clip_0001.wav', 'clip_0002.wav'])
+          ),
+      )
+      ```
+
+      Scores for a date range, across all deployments:
+
+      ```python
+      import datetime as dt
+
+      batch = db.get_scores(
+          start_date=dt.datetime(2024, 6, 1, tzinfo=dt.timezone.utc),
+          end_date=dt.datetime(2024, 9, 1, tzinfo=dt.timezone.utc),
+      )
+      ```
+
+      Any of `deployments_filter`/`recordings_filter`/`start_date`/
+      `end_date` can be combined in one call, e.g. one deployment within a
+      date range. `batch.scores` is `[len(batch), len(batch.class_labels)]`;
+      `batch.class_labels[j]` names `batch.scores[:, j]`'s class.
+    """
+    require_timezone_aware(start_date, 'start_date')
+    require_timezone_aware(end_date, 'end_date')
+    self._validate_filter_columns('recordings', recordings_filter)
+    class_labels = self.classes
+
+    if deployments_filter is not None:
+      deployment_ids = [
+          d.id for d in self.get_all_deployments(filter=deployments_filter)
+      ]
+    else:
+      deployment_ids = [d.id for d in self.get_all_deployments()]
+    if not deployment_ids:
+      return _empty_score_batch(class_labels)
+
+    union_query = self._wide_scores_union_query(deployment_ids)
+    if union_query is None:
+      return _empty_score_batch(class_labels)
+
+    conditions, values = format_sql_where_conditions(
+        recordings_filter, table_prefix='recordings'
+    )
+    date_conditions = []
+    if start_date is not None:
+      date_conditions.append('recordings.datetime >= ?')
+      values.append(start_date)
+    if end_date is not None:
+      date_conditions.append('recordings.datetime <= ?')
+      values.append(end_date)
+    all_conditions = [c for c in [conditions] + date_conditions if c]
+    where_clause = (
+        f"WHERE {' AND '.join(all_conditions)}" if all_conditions else ''
+    )
+
+    class_columns_str = ', '.join(
+        f'scores.{quote_sql_identifier(c)}' for c in class_labels
+    )
+    query = f"""
+        SELECT
+            scores.deployment_id,
+            scores.recording_id,
+            scores.start_time,
+            scores.end_time,
+            {class_columns_str}
+        FROM ({union_query}) AS scores
+        JOIN recordings ON scores.recording_id = recordings.id
+        {where_clause}
+        """
+    rows = self.db.execute(query, values).fetchall()
+    if not rows:
+      return _empty_score_batch(class_labels)
+
+    columns = np.array(rows, dtype=object)
+    return ScoreBatch(
+        deployment_ids=columns[:, 0].astype(np.int64),
+        recording_ids=columns[:, 1].astype(np.int64),
+        start_times=columns[:, 2].astype(np.float64),
+        end_times=columns[:, 3].astype(np.float64),
+        scores=columns[:, 4:].astype(np.float16),
+        class_labels=class_labels,
+    )
 
   def add_detections_from_threshold(
       self,
@@ -2752,3 +3939,28 @@ def _empty_select_scores_frame(
   if selection == 'binned':
     columns.append('bin_idx')
   return pd.DataFrame(columns=columns)
+
+
+def _empty_sampling_effort_frame(by_deployment: bool, date_bins: Any) -> Any:
+  """An empty DataFrame with the schema `sampling_effort()` would return."""
+  import pandas as pd  # pylint: disable=g-import-not-at-top
+
+  columns = []
+  if by_deployment:
+    columns += ['deployment_id', 'deployment_name']
+  if date_bins is not None:
+    columns.append('date_bin_label')
+  columns.append('n_windows')
+  return pd.DataFrame(columns=columns)
+
+
+def _empty_score_batch(class_labels: Sequence[str]) -> ScoreBatch:
+  """An empty `ScoreBatch` with the right dtypes/shape for `get_scores()`."""
+  return ScoreBatch(
+      deployment_ids=np.zeros((0,), dtype=np.int64),
+      recording_ids=np.zeros((0,), dtype=np.int64),
+      start_times=np.zeros((0,), dtype=np.float64),
+      end_times=np.zeros((0,), dtype=np.float64),
+      scores=np.zeros((0, len(class_labels)), dtype=np.float16),
+      class_labels=class_labels,
+  )

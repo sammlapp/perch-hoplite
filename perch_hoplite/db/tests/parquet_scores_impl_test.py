@@ -29,6 +29,7 @@ import tempfile
 
 from ml_collections import config_dict
 import numpy as np
+import pandas as pd
 from perch_hoplite.db import datatypes
 from perch_hoplite.db import parquet_scores_impl as psi
 
@@ -724,6 +725,150 @@ class ParquetScoresDBTest(parameterized.TestCase):
       )
 
   # ---------------------------------------------------------------------
+  # count_recordings / count_detections / count_windows.
+  # ---------------------------------------------------------------------
+
+  def test_count_recordings(self):
+    db = self.make_db()
+    deployment_id, _ = self.insert_deployment_with_recordings(
+        db, num_recordings=3
+    )
+    other_deployment_id, _ = self.insert_deployment_with_recordings(
+        db, num_recordings=2, name='d2'
+    )
+    self.assertEqual(db.count_recordings(), 5)
+    self.assertEqual(
+        db.count_recordings(
+            filter=config_dict.create(eq=dict(deployment_id=deployment_id))
+        ),
+        3,
+    )
+    self.assertEqual(
+        db.count_recordings(
+            filter=config_dict.create(
+                eq=dict(deployment_id=other_deployment_id)
+            )
+        ),
+        2,
+    )
+
+  def test_count_recordings_wrong_filter_column_raises_clearly(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.count_recordings(filter=config_dict.create(eq=dict(not_a_col=1)))
+
+  def test_count_detections_matches_len_get_all_detections(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    db.insert_detection(
+        recording_id=recording_ids[0],
+        offsets=[0.0, 3.0],
+        class_name='alpha',
+        score=0.9,
+    )
+    db.insert_detection(
+        recording_id=recording_ids[1],
+        offsets=[0.0, 3.0],
+        class_name='beta',
+        score=0.8,
+    )
+    self.assertEqual(db.count_detections(), 2)
+    self.assertEqual(
+        db.count_detections(
+            filter=config_dict.create(eq=dict(class_name='beta'))
+        ),
+        1,
+    )
+    self.assertEqual(
+        db.count_detections(
+            recordings_filter=config_dict.create(eq=dict(filename='f0.wav'))
+        ),
+        1,
+    )
+    self.assertEqual(
+        db.count_detections(
+            deployments_filter=config_dict.create(eq=dict(id=deployment_id))
+        ),
+        2,
+    )
+
+  def test_count_detections_wrong_filter_column_raises_clearly(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.count_detections(filter=config_dict.create(eq=dict(not_a_col=1)))
+    with self.assertRaises(ValueError):
+      db.count_detections(
+          deployments_filter=config_dict.create(eq=dict(deployment_id=1))
+      )
+    with self.assertRaises(ValueError):
+      db.count_detections(
+          recordings_filter=config_dict.create(eq=dict(not_a_col=1))
+      )
+
+  def test_count_windows_empty_database_returns_zero(self):
+    db = self.make_db()
+    self.assertEqual(db.count_windows(), 0)
+
+  def test_count_windows_no_scores_written_returns_zero(self):
+    db = self.make_db()
+    deployment_id, _ = self.insert_deployment_with_recordings(db)
+    self.assertEqual(db.count_windows(deployment_id=deployment_id), 0)
+
+  def test_count_windows_single_deployment(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=1
+    )
+    scores = np.zeros((5, len(CLASS_LABELS)), dtype=np.float16)
+    db.insert_deployment_scores(
+        deployment_id,
+        recording_ids * 5,
+        [0.0, 3.0, 6.0, 9.0, 12.0],
+        [3.0, 6.0, 9.0, 12.0, 15.0],
+        scores,
+    )
+    self.assertEqual(db.count_windows(deployment_id=deployment_id), 5)
+
+  def test_count_windows_sums_across_chunks_and_deployments(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    db.insert_deployment_scores(
+        deployment_id,
+        [recording_ids[0]],
+        [0.0],
+        [3.0],
+        np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
+    )
+    db.insert_deployment_scores(
+        deployment_id,
+        [recording_ids[1]],
+        [0.0],
+        [3.0],
+        np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
+    )
+    self.assertEqual(db.count_windows(deployment_id=deployment_id), 2)
+
+    other_deployment_id, other_recording_ids = (
+        self.insert_deployment_with_recordings(
+            db, num_recordings=1, name='d2'
+        )
+    )
+    db.insert_deployment_scores(
+        other_deployment_id,
+        other_recording_ids,
+        [0.0],
+        [3.0],
+        np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
+    )
+    self.assertEqual(db.count_windows(deployment_id=deployment_id), 2)
+    self.assertEqual(db.count_windows(deployment_id=other_deployment_id), 1)
+    self.assertEqual(db.count_windows(), 3)
+
+  # ---------------------------------------------------------------------
   # select_detections.
   # ---------------------------------------------------------------------
 
@@ -821,6 +966,42 @@ class ParquetScoresDBTest(parameterized.TestCase):
       sub = result[result['stratum'] == deployment_id]
       self.assertEqual(
           list(sub['score']), sorted(sub['score'], reverse=True)
+      )
+
+  def test_select_detections_by_deployment_fields(self):
+    db = self.make_db()
+    d1 = db.insert_deployment(name='d1', project='p', management_unit='u1')
+    d2 = db.insert_deployment(name='d2', project='p', management_unit='u2')
+    r1 = db.insert_recording(filename='f0.wav', deployment_id=d1)
+    r2 = db.insert_recording(filename='f0.wav', deployment_id=d2)
+    db.insert_detection(
+        recording_id=r1, offsets=[0.0, 3.0], class_name='alpha', score=0.9
+    )
+    db.insert_detection(
+        recording_id=r2, offsets=[0.0, 3.0], class_name='alpha', score=0.5
+    )
+
+    result = db.select_detections(
+        selection='top', n=10, by_deployment_fields=['management_unit']
+    )
+    self.assertIn('management_unit', result.columns)
+    self.assertEqual(set(result['stratum']), {'u1', 'u2'})
+
+  def test_select_detections_by_deployment_and_by_deployment_fields_raises(
+      self,
+  ):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.select_detections(
+          selection='top', n=1, by_deployment=True,
+          by_deployment_fields=['project'],
+      )
+
+  def test_select_detections_by_deployment_fields_unknown_column_raises(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.select_detections(
+          selection='top', n=1, by_deployment_fields=['not_a_real_field']
       )
 
   def test_select_detections_deployments_filter(self):
@@ -985,7 +1166,9 @@ class ParquetScoresDBTest(parameterized.TestCase):
           deployment_id, recording_ids, [0.0, 1.0], [3.0], scores
       )
 
-  def test_insert_deployment_scores_errors_on_existing_file_by_default(self):
+  def test_insert_deployment_scores_errors_on_existing_recording_by_default(
+      self,
+  ):
     db = self.make_db()
     deployment_id, recording_ids = self.insert_deployment_with_recordings(db)
     scores = np.zeros((1, len(CLASS_LABELS)), dtype=np.float16)
@@ -1009,7 +1192,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
         [0.0],
         [3.0],
         scores_2,
-        handle_existing='overwrite',
+        handle_existing_recordings='overwrite',
     )
     batch = db.get_scores_batch(deployment_id, recording_ids, [0.0], [3.0])
     np.testing.assert_allclose(batch, scores_2)
@@ -1040,6 +1223,533 @@ class ParquetScoresDBTest(parameterized.TestCase):
     db.insert_deployment_scores(deployment_id, recording_ids, [0.0], [3.0], scores)
     with self.assertRaises(KeyError):
       db.get_scores_batch(deployment_id, recording_ids, [999.0], [1002.0])
+
+  # ---------------------------------------------------------------------
+  # get_scores.
+  # ---------------------------------------------------------------------
+
+  def make_two_deployment_get_scores_setup(self):
+    """d1 has 2 windows (Jan), d2 has 1 window (Jul)."""
+    db = self.make_db()
+    d1 = db.insert_deployment(name='site_1', project='p')
+    d2 = db.insert_deployment(name='site_2', project='p')
+    r1 = db.insert_recording(
+        filename='clip_0001.wav',
+        deployment_id=d1,
+        datetime=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+    )
+    r2 = db.insert_recording(
+        filename='clip_0002.wav',
+        deployment_id=d2,
+        datetime=dt.datetime(2024, 7, 1, tzinfo=dt.timezone.utc),
+    )
+    scores_1 = np.array(
+        [[0.1, 0.2, 0.3, 0.4, 0.5], [0.6, 0.7, 0.8, 0.9, 0.15]],
+        dtype=np.float16,
+    )
+    scores_2 = np.array([[0.9, 0.8, 0.7, 0.6, 0.5]], dtype=np.float16)
+    db.insert_deployment_scores(d1, [r1, r1], [0.0, 3.0], [3.0, 6.0], scores_1)
+    db.insert_deployment_scores(d2, [r2], [0.0], [3.0], scores_2)
+    return db, d1, d2, r1, r2, scores_1, scores_2
+
+  def test_get_scores_all(self):
+    db, d1, d2, r1, r2, scores_1, scores_2 = (
+        self.make_two_deployment_get_scores_setup()
+    )
+    batch = db.get_scores()
+    self.assertLen(batch, 3)
+    self.assertEqual(batch.class_labels, CLASS_LABELS)
+    self.assertEqual(batch.scores.shape, (3, len(CLASS_LABELS)))
+    self.assertCountEqual(batch.deployment_ids.tolist(), [d1, d1, d2])
+    self.assertCountEqual(batch.recording_ids.tolist(), [r1, r1, r2])
+
+  def test_get_scores_by_deployment_name_list(self):
+    db, d1, d2, r1, r2, scores_1, scores_2 = (
+        self.make_two_deployment_get_scores_setup()
+    )
+    batch = db.get_scores(
+        deployments_filter=config_dict.create(isin=dict(name=['site_1']))
+    )
+    self.assertLen(batch, 2)
+    self.assertTrue(np.all(batch.deployment_ids == d1))
+    np.testing.assert_allclose(
+        sorted(batch.scores.tolist()), sorted(scores_1.tolist())
+    )
+
+  def test_get_scores_by_recording_filename_list(self):
+    db, d1, d2, r1, r2, scores_1, scores_2 = (
+        self.make_two_deployment_get_scores_setup()
+    )
+    batch = db.get_scores(
+        recordings_filter=config_dict.create(
+            isin=dict(filename=['clip_0002.wav'])
+        )
+    )
+    self.assertLen(batch, 1)
+    self.assertEqual(batch.recording_ids[0], r2)
+    np.testing.assert_allclose(batch.scores, scores_2)
+
+  def test_get_scores_by_date_range(self):
+    db, d1, d2, r1, r2, scores_1, scores_2 = (
+        self.make_two_deployment_get_scores_setup()
+    )
+    batch = db.get_scores(
+        start_date=dt.datetime(2024, 6, 1, tzinfo=dt.timezone.utc)
+    )
+    self.assertLen(batch, 1)
+    self.assertEqual(batch.recording_ids[0], r2)
+
+    batch = db.get_scores(
+        end_date=dt.datetime(2024, 6, 1, tzinfo=dt.timezone.utc)
+    )
+    self.assertLen(batch, 2)
+    self.assertTrue(np.all(batch.deployment_ids == d1))
+
+  def test_get_scores_combined_filters(self):
+    db, d1, d2, r1, r2, scores_1, scores_2 = (
+        self.make_two_deployment_get_scores_setup()
+    )
+    batch = db.get_scores(
+        deployments_filter=config_dict.create(eq=dict(id=d1)),
+        start_date=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+        end_date=dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc),
+    )
+    self.assertLen(batch, 2)
+    self.assertTrue(np.all(batch.deployment_ids == d1))
+
+  def test_get_scores_no_matching_deployments_returns_empty(self):
+    db, _, _, _, _, _, _ = self.make_two_deployment_get_scores_setup()
+    batch = db.get_scores(
+        deployments_filter=config_dict.create(eq=dict(name='nonexistent'))
+    )
+    self.assertEmpty(batch)
+    self.assertEqual(batch.scores.shape, (0, len(CLASS_LABELS)))
+    self.assertEqual(batch.class_labels, CLASS_LABELS)
+
+  def test_get_scores_no_recordings_filter_match_returns_empty(self):
+    db, _, _, _, _, _, _ = self.make_two_deployment_get_scores_setup()
+    batch = db.get_scores(
+        recordings_filter=config_dict.create(eq=dict(filename='nope.wav'))
+    )
+    self.assertEmpty(batch)
+
+  def test_get_scores_no_scores_written_returns_empty(self):
+    db = self.make_db()
+    self.insert_deployment_with_recordings(db)  # No insert_deployment_scores.
+    batch = db.get_scores()
+    self.assertEmpty(batch)
+    self.assertEqual(batch.scores.shape, (0, len(CLASS_LABELS)))
+
+  def test_get_scores_empty_database(self):
+    db = self.make_db()
+    batch = db.get_scores()
+    self.assertEmpty(batch)
+    self.assertEqual(batch.class_labels, CLASS_LABELS)
+
+  def test_get_scores_recordings_filter_wrong_column_raises_clearly(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.get_scores(
+          recordings_filter=config_dict.create(eq=dict(not_a_col=1))
+      )
+
+  def test_get_scores_naive_start_end_date_raises(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.get_scores(start_date=dt.datetime(2024, 1, 1))
+    with self.assertRaises(ValueError):
+      db.get_scores(end_date=dt.datetime(2024, 1, 1))
+
+  def test_get_scores_spans_multiple_chunks(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    scores_a = np.full((1, len(CLASS_LABELS)), 0.1, dtype=np.float16)
+    scores_b = np.full((1, len(CLASS_LABELS)), 0.2, dtype=np.float16)
+    db.insert_deployment_scores(
+        deployment_id, [recording_ids[0]], [0.0], [3.0], scores_a
+    )
+    db.insert_deployment_scores(
+        deployment_id, [recording_ids[1]], [0.0], [3.0], scores_b
+    )
+    batch = db.get_scores()
+    self.assertLen(batch, 2)
+    np.testing.assert_allclose(
+        sorted(batch.scores.tolist()),
+        sorted(np.concatenate([scores_a, scores_b]).tolist()),
+    )
+
+  # ---------------------------------------------------------------------
+  # add_deployment_metadata / add_recording_metadata.
+  # ---------------------------------------------------------------------
+
+  def make_metadata_merge_setup(self):
+    db = self.make_db()
+    d1 = db.insert_deployment(name='site_1', project='p', latitude=1.5)
+    d2 = db.insert_deployment(name='site_2', project='p', latitude=2.5)
+    r1 = db.insert_recording(
+        filename='clip_0001.wav',
+        deployment_id=d1,
+        datetime=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+    )
+    r2 = db.insert_recording(
+        filename='clip_0002.wav',
+        deployment_id=d2,
+        datetime=dt.datetime(2024, 7, 1, tzinfo=dt.timezone.utc),
+    )
+    db.insert_deployment_scores(
+        d1, [r1], [0.0], [3.0],
+        np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
+    )
+    db.insert_deployment_scores(
+        d2, [r2], [0.0], [3.0],
+        np.ones((1, len(CLASS_LABELS)), dtype=np.float16),
+    )
+    return db, d1, d2, r1, r2
+
+  def test_add_deployment_metadata_adds_columns_without_duplicating_id(self):
+    db, d1, d2, r1, r2 = self.make_metadata_merge_setup()
+    df = db.get_scores().to_pandas()
+    merged = psi.add_deployment_metadata(db, df)
+
+    self.assertNotIn('id', merged.columns)
+    self.assertNotIn('name', merged.columns)
+    self.assertNotIn('deployment_id_x', merged.columns)
+    self.assertNotIn('deployment_id_y', merged.columns)
+    for col in ('deployment_name', 'project', 'latitude', 'longitude'):
+      self.assertIn(col, merged.columns)
+    lookup = dict(zip(merged['deployment_id'], merged['deployment_name']))
+    self.assertEqual(lookup, {d1: 'site_1', d2: 'site_2'})
+
+  def test_add_deployment_metadata_new_columns_lead(self):
+    db, _, _, _, _ = self.make_metadata_merge_setup()
+    df = db.get_scores().to_pandas()
+    original_columns = list(df.columns)
+    merged = psi.add_deployment_metadata(db, df)
+
+    new_columns = [c for c in merged.columns if c not in original_columns]
+    self.assertNotEmpty(new_columns)
+    self.assertEqual(
+        list(merged.columns), new_columns + original_columns
+    )
+
+  def test_add_recording_metadata_adds_columns_without_duplicating_deployment_id(
+      self,
+  ):
+    db, d1, d2, r1, r2 = self.make_metadata_merge_setup()
+    df = db.get_scores().to_pandas()
+    merged = psi.add_deployment_metadata(db, df)
+    merged = psi.add_recording_metadata(db, merged)
+
+    self.assertNotIn('id', merged.columns)
+    self.assertNotIn('deployment_id_x', merged.columns)
+    self.assertNotIn('deployment_id_y', merged.columns)
+    self.assertIn('filename', merged.columns)
+    self.assertIn('datetime', merged.columns)
+    lookup = dict(zip(merged['recording_id'], merged['filename']))
+    self.assertEqual(lookup, {r1: 'clip_0001.wav', r2: 'clip_0002.wav'})
+    # deployment_id survives the second merge unduplicated/untouched.
+    self.assertEqual(
+        dict(zip(merged['recording_id'], merged['deployment_id'])),
+        {r1: d1, r2: d2},
+    )
+
+  def test_add_recording_metadata_new_columns_lead(self):
+    db, _, _, _, _ = self.make_metadata_merge_setup()
+    df = db.get_scores().to_pandas()
+    original_columns = list(df.columns)
+    merged = psi.add_recording_metadata(db, df)
+
+    new_columns = [c for c in merged.columns if c not in original_columns]
+    self.assertNotEmpty(new_columns)
+    self.assertEqual(
+        list(merged.columns), new_columns + original_columns
+    )
+
+  def test_add_deployment_metadata_unmatched_key_gets_nan_not_dropped(self):
+    db, _, _, _, _ = self.make_metadata_merge_setup()
+    df = pd.DataFrame({'deployment_id': [12345]})
+    merged = psi.add_deployment_metadata(db, df)
+    self.assertLen(merged, 1)
+    self.assertEqual(merged['deployment_id'].iloc[0], 12345)
+    self.assertTrue(pd.isna(merged['deployment_name'].iloc[0]))
+
+  def test_add_recording_metadata_unmatched_key_gets_nan_not_dropped(self):
+    db, _, _, _, _ = self.make_metadata_merge_setup()
+    df = pd.DataFrame({'recording_id': [12345]})
+    merged = psi.add_recording_metadata(db, df)
+    self.assertLen(merged, 1)
+    self.assertEqual(merged['recording_id'].iloc[0], 12345)
+    self.assertTrue(pd.isna(merged['filename'].iloc[0]))
+
+  def test_add_deployment_metadata_empty_df(self):
+    db, _, _, _, _ = self.make_metadata_merge_setup()
+    df = pd.DataFrame({'deployment_id': pd.Series([], dtype='int64')})
+    merged = psi.add_deployment_metadata(db, df)
+    self.assertEmpty(merged)
+    for col in (
+        'deployment_id', 'deployment_name', 'project', 'latitude',
+        'longitude',
+    ):
+      self.assertIn(col, merged.columns)
+
+  def test_add_deployment_metadata_missing_foreign_key_column_raises(self):
+    db, _, _, _, _ = self.make_metadata_merge_setup()
+    with self.assertRaises(ValueError):
+      psi.add_deployment_metadata(db, pd.DataFrame({'not_a_key': [1]}))
+
+  def test_add_recording_metadata_missing_foreign_key_column_raises(self):
+    db, _, _, _, _ = self.make_metadata_merge_setup()
+    with self.assertRaises(ValueError):
+      psi.add_recording_metadata(db, pd.DataFrame({'not_a_key': [1]}))
+
+  def test_add_deployment_metadata_custom_foreign_key_is_id(self):
+    db, d1, d2, _, _ = self.make_metadata_merge_setup()
+    df = pd.DataFrame({'id': [d1, d2]})
+    merged = psi.add_deployment_metadata(db, df, foreign_key='id')
+    self.assertEqual(
+        dict(zip(merged['id'], merged['deployment_name'])),
+        {d1: 'site_1', d2: 'site_2'},
+    )
+
+  def test_add_deployment_metadata_works_on_select_scores_output(self):
+    # Not tied to ScoreBatch.to_pandas() specifically -- should work on any
+    # frame with the right foreign-key column, e.g. select_scores()'s.
+    db, d1, d2, r1, r2 = self.make_metadata_merge_setup()
+    result = db.select_scores('alpha', selection='top', n=10)
+    merged = psi.add_deployment_metadata(db, result)
+    self.assertIn('latitude', merged.columns)
+
+  # ---------------------------------------------------------------------
+  # Multi-chunk score storage (PARQUET_DUCKDB_PLAN.md, Q9).
+  # ---------------------------------------------------------------------
+
+  def test_multiple_calls_write_disjoint_chunks_queryable_together(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    scores_1 = np.full((1, len(CLASS_LABELS)), 0.1, dtype=np.float16)
+    scores_2 = np.full((1, len(CLASS_LABELS)), 0.2, dtype=np.float16)
+    db.insert_deployment_scores(
+        deployment_id, [recording_ids[0]], [0.0], [3.0], scores_1
+    )
+    db.insert_deployment_scores(
+        deployment_id, [recording_ids[1]], [0.0], [3.0], scores_2
+    )
+
+    chunk_paths = db._deployment_chunk_paths(deployment_id)
+    self.assertLen(chunk_paths, 2)
+
+    batch = db.get_scores_batch(
+        deployment_id, recording_ids, [0.0, 0.0], [3.0, 3.0]
+    )
+    np.testing.assert_allclose(batch, np.concatenate([scores_1, scores_2]))
+
+    result = db.select_scores('alpha', selection='top', n=10)
+    self.assertLen(result, 2)
+
+    detection_ids = db.add_detections_from_threshold(
+        class_name='alpha', threshold=0.05
+    )
+    self.assertLen(detection_ids, 2)
+
+  def test_handle_existing_recordings_skip_partial_overlap(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    old_scores = np.full((1, len(CLASS_LABELS)), 0.1, dtype=np.float16)
+    db.insert_deployment_scores(
+        deployment_id, [recording_ids[0]], [0.0], [3.0], old_scores
+    )
+
+    new_scores_for_existing = np.full(
+        (1, len(CLASS_LABELS)), 0.9, dtype=np.float16
+    )
+    new_scores_for_new = np.full(
+        (1, len(CLASS_LABELS)), 0.5, dtype=np.float16
+    )
+    db.insert_deployment_scores(
+        deployment_id,
+        recording_ids,
+        [0.0, 0.0],
+        [3.0, 3.0],
+        np.concatenate([new_scores_for_existing, new_scores_for_new]),
+        handle_existing_recordings='skip',
+    )
+
+    # recording_ids[0]'s scores are untouched (not overwritten by 'skip');
+    # recording_ids[1]'s scores are the newly-written ones.
+    batch = db.get_scores_batch(
+        deployment_id, recording_ids, [0.0, 0.0], [3.0, 3.0]
+    )
+    np.testing.assert_allclose(batch[0:1], old_scores)
+    np.testing.assert_allclose(batch[1:2], new_scores_for_new)
+    self.assertLen(db._deployment_chunk_paths(deployment_id), 2)
+
+  def test_insert_deployment_scores_empty_batch_writes_nothing(self):
+    db = self.make_db()
+    deployment_id, _ = self.insert_deployment_with_recordings(db)
+    scores = np.zeros((0, len(CLASS_LABELS)), dtype=np.float16)
+
+    db.insert_deployment_scores(deployment_id, [], [], [], scores)
+
+    self.assertEmpty(db._deployment_chunk_paths(deployment_id))
+
+  def test_handle_existing_recordings_skip_all_existing_writes_nothing(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(db)
+    scores = np.zeros((1, len(CLASS_LABELS)), dtype=np.float16)
+    db.insert_deployment_scores(deployment_id, recording_ids, [0.0], [3.0], scores)
+    chunk_paths_before = db._deployment_chunk_paths(deployment_id)
+
+    db.insert_deployment_scores(
+        deployment_id,
+        recording_ids,
+        [0.0],
+        [3.0],
+        np.ones((1, len(CLASS_LABELS)), dtype=np.float16),
+        handle_existing_recordings='skip',
+    )
+
+    self.assertEqual(
+        chunk_paths_before, db._deployment_chunk_paths(deployment_id)
+    )
+
+  def test_handle_existing_recordings_error_partial_overlap_writes_nothing(
+      self,
+  ):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    db.insert_deployment_scores(
+        deployment_id,
+        [recording_ids[0]],
+        [0.0],
+        [3.0],
+        np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
+    )
+    chunk_paths_before = db._deployment_chunk_paths(deployment_id)
+
+    with self.assertRaises(ValueError):
+      db.insert_deployment_scores(
+          deployment_id,
+          recording_ids,
+          [0.0, 0.0],
+          [3.0, 3.0],
+          np.ones((2, len(CLASS_LABELS)), dtype=np.float16),
+      )
+
+    # Nothing written: same chunk file(s) as before the failed call.
+    self.assertEqual(
+        chunk_paths_before, db._deployment_chunk_paths(deployment_id)
+    )
+
+  def test_handle_existing_recordings_overwrite_spans_multiple_chunks(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    scores_a = np.full((1, len(CLASS_LABELS)), 0.1, dtype=np.float16)
+    scores_b = np.full((1, len(CLASS_LABELS)), 0.2, dtype=np.float16)
+    db.insert_deployment_scores(
+        deployment_id, [recording_ids[0]], [0.0], [3.0], scores_a
+    )
+    db.insert_deployment_scores(
+        deployment_id, [recording_ids[1]], [0.0], [3.0], scores_b
+    )
+    chunk_paths_before = db._deployment_chunk_paths(deployment_id)
+    self.assertLen(chunk_paths_before, 2)
+    chunk_path_by_recording_before = {
+        r: db.get_recording(r).score_chunk_path for r in recording_ids
+    }
+
+    new_scores = np.full((2, len(CLASS_LABELS)), 0.99, dtype=np.float16)
+    db.insert_deployment_scores(
+        deployment_id,
+        recording_ids,
+        [0.0, 0.0],
+        [3.0, 3.0],
+        new_scores,
+        handle_existing_recordings='overwrite',
+    )
+
+    # No new chunk written (every recording in the batch already existed).
+    self.assertEqual(
+        chunk_paths_before, db._deployment_chunk_paths(deployment_id)
+    )
+    # `score_chunk_path` is unchanged for both recordings -- updated in
+    # place, not moved to a new chunk.
+    for r in recording_ids:
+      self.assertEqual(
+          db.get_recording(r).score_chunk_path,
+          chunk_path_by_recording_before[r],
+      )
+    batch = db.get_scores_batch(
+        deployment_id, recording_ids, [0.0, 0.0], [3.0, 3.0]
+    )
+    np.testing.assert_allclose(batch, new_scores)
+
+  def test_handle_existing_recordings_overwrite_mixed_new_and_existing(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    old_scores = np.full((1, len(CLASS_LABELS)), 0.1, dtype=np.float16)
+    db.insert_deployment_scores(
+        deployment_id, [recording_ids[0]], [0.0], [3.0], old_scores
+    )
+    old_chunk_path = db.get_recording(recording_ids[0]).score_chunk_path
+
+    new_scores = np.full((2, len(CLASS_LABELS)), 0.99, dtype=np.float16)
+    db.insert_deployment_scores(
+        deployment_id,
+        recording_ids,
+        [0.0, 0.0],
+        [3.0, 3.0],
+        new_scores,
+        handle_existing_recordings='overwrite',
+    )
+
+    # recording_ids[0] updated in place (same chunk path); recording_ids[1]
+    # is genuinely new and gets a newly-written chunk.
+    self.assertEqual(
+        db.get_recording(recording_ids[0]).score_chunk_path, old_chunk_path
+    )
+    self.assertIsNotNone(
+        db.get_recording(recording_ids[1]).score_chunk_path
+    )
+    self.assertLen(db._deployment_chunk_paths(deployment_id), 2)
+    batch = db.get_scores_batch(
+        deployment_id, recording_ids, [0.0, 0.0], [3.0, 3.0]
+    )
+    np.testing.assert_allclose(batch, new_scores)
+
+  def test_remove_deployment_deletes_all_chunk_files(self):
+    db = self.make_db()
+    deployment_id, recording_ids = self.insert_deployment_with_recordings(
+        db, num_recordings=3
+    )
+    for recording_id in recording_ids:
+      db.insert_deployment_scores(
+          deployment_id,
+          [recording_id],
+          [0.0],
+          [3.0],
+          np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
+      )
+    chunk_paths = db._deployment_chunk_paths(deployment_id)
+    self.assertLen(chunk_paths, 3)
+    for chunk_path in chunk_paths:
+      self.assertTrue(chunk_path.exists())
+
+    db.remove_deployment(deployment_id)
+
+    for chunk_path in chunk_paths:
+      self.assertFalse(chunk_path.exists())
 
   def make_multi_deployment_scores(
       self, num_recordings=10, num_deployments=2, seed=0
@@ -1146,6 +1856,103 @@ class ParquetScoresDBTest(parameterized.TestCase):
       self.assertEqual(
           list(sub['score']), sorted(sub['score'], reverse=True)
       )
+
+  def test_select_scores_by_deployment_fields_single_field(self):
+    db = self.make_db()
+    d1, r1 = self.insert_deployment_with_recordings(
+        db, name='d1', management_unit='unit_x'
+    )
+    d2, r2 = self.insert_deployment_with_recordings(
+        db, name='d2', management_unit='unit_y'
+    )
+    d3, r3 = self.insert_deployment_with_recordings(
+        db, name='d3', management_unit='unit_x'
+    )
+    scores = np.zeros((1, len(CLASS_LABELS)), dtype=np.float16)
+    scores[0, 0] = 0.9
+    db.insert_deployment_scores(d1, r1, [0.0], [3.0], scores)
+    db.insert_deployment_scores(d2, r2, [0.0], [3.0], scores)
+    db.insert_deployment_scores(d3, r3, [0.0], [3.0], scores)
+
+    result = db.select_scores(
+        'alpha', selection='top', n=10,
+        by_deployment_fields=['management_unit'],
+    )
+    self.assertIn('management_unit', result.columns)
+    self.assertEqual(set(result['stratum']), {'unit_x', 'unit_y'})
+    self.assertEqual(
+        set(result[result['stratum'] == 'unit_x']['deployment_id']),
+        {d1, d3},
+    )
+
+  def test_select_scores_by_deployment_fields_multiple_fields(self):
+    db = self.make_db()
+    d1 = db.insert_deployment(name='d1', project='p1', management_unit='u1')
+    r1 = [db.insert_recording(filename='f0.wav', deployment_id=d1)]
+    scores = np.zeros((1, len(CLASS_LABELS)), dtype=np.float16)
+    db.insert_deployment_scores(d1, r1, [0.0], [3.0], scores)
+
+    result = db.select_scores(
+        'alpha', selection='top', n=10,
+        by_deployment_fields=['project', 'management_unit'],
+    )
+    self.assertIn('project', result.columns)
+    self.assertIn('management_unit', result.columns)
+    self.assertEqual(
+        result['stratum'].iloc[0], {'project': 'p1', 'management_unit': 'u1'}
+    )
+
+  def test_select_scores_by_deployment_fields_id_matches_by_deployment(self):
+    db, deployment_ids, _ = self.make_multi_deployment_scores(
+        num_deployments=2
+    )
+    by_flag = db.select_scores('alpha', selection='top', n=2, by_deployment=True)
+    by_field = db.select_scores(
+        'alpha', selection='top', n=2, by_deployment_fields=['id']
+    )
+    self.assertEqual(list(by_flag['stratum']), list(by_field['stratum']))
+    self.assertNotIn('id', by_field.columns)
+
+  def test_select_scores_by_deployment_and_by_deployment_fields_raises(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.select_scores(
+          'alpha', selection='top', n=1,
+          by_deployment=True,
+          by_deployment_fields=['project'],
+      )
+
+  def test_select_scores_by_deployment_fields_unknown_column_raises(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.select_scores(
+          'alpha', selection='top', n=1,
+          by_deployment_fields=['not_a_real_field'],
+      )
+
+  def test_select_scores_by_deployment_fields_composes_with_date_bins(self):
+    db = self.make_db()
+    d1, r1 = self.insert_deployment_with_recordings(
+        db, name='d1', management_unit='u1'
+    )
+    db.db.execute(
+        'UPDATE recordings SET datetime = ? WHERE id = ?',
+        [dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc), r1[0]],
+    )
+    scores = np.zeros((1, len(CLASS_LABELS)), dtype=np.float16)
+    db.insert_deployment_scores(d1, r1, [0.0], [3.0], scores)
+
+    result = db.select_scores(
+        'alpha', selection='top', n=10,
+        by_deployment_fields=['management_unit'],
+        date_bins='week',
+    )
+    self.assertIn('management_unit', result.columns)
+    self.assertIn('date_bin_label', result.columns)
+    self.assertEqual(
+        result['stratum'].iloc[0]['management_unit'], 'u1'
+    )
+    self.assertIn('date_bin', result['stratum'].iloc[0])
 
   def test_select_scores_deployments_filter(self):
     db, deployment_ids, _ = self.make_multi_deployment_scores()
@@ -1349,6 +2156,171 @@ class ParquetScoresDBTest(parameterized.TestCase):
     result = db.select_scores('alpha', selection='top', n=5)
     self.assertEmpty(result)
 
+  # ---------------------------------------------------------------------
+  # sampling_effort.
+  # ---------------------------------------------------------------------
+
+  def make_two_deployment_sampling_setup(self):
+    """Two deployments: d1 has 2 windows (week 1), d2 has 1 window (week 3)."""
+    db = self.make_db()
+    d1 = db.insert_deployment(name='d1', project='p')
+    d2 = db.insert_deployment(name='d2', project='p')
+    r1 = db.insert_recording(
+        filename='f1.wav',
+        deployment_id=d1,
+        datetime=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+    )
+    r2 = db.insert_recording(
+        filename='f2.wav',
+        deployment_id=d2,
+        datetime=dt.datetime(2024, 1, 15, tzinfo=dt.timezone.utc),
+    )
+    db.insert_deployment_scores(
+        d1, [r1, r1], [0.0, 3.0], [3.0, 6.0],
+        np.zeros((2, len(CLASS_LABELS)), dtype=np.float16),
+    )
+    db.insert_deployment_scores(
+        d2, [r2], [0.0], [3.0],
+        np.zeros((1, len(CLASS_LABELS)), dtype=np.float16),
+    )
+    return db, d1, d2, r1, r2
+
+  def test_sampling_effort_no_stratification(self):
+    db, _, _, _, _ = self.make_two_deployment_sampling_setup()
+    result = db.sampling_effort()
+    self.assertEqual(list(result.columns), ['n_windows'])
+    self.assertEqual(result['n_windows'].iloc[0], 3)
+
+  def test_sampling_effort_by_deployment(self):
+    db, d1, d2, _, _ = self.make_two_deployment_sampling_setup()
+    result = db.sampling_effort(by_deployment=True)
+    counts = dict(zip(result['deployment_id'], result['n_windows']))
+    self.assertEqual(counts, {d1: 2, d2: 1})
+
+  def test_sampling_effort_by_deployment_includes_zero_recording_deployment(
+      self,
+  ):
+    db, d1, d2, _, _ = self.make_two_deployment_sampling_setup()
+    d3 = db.insert_deployment(name='d3', project='p')
+    result = db.sampling_effort(by_deployment=True)
+    counts = dict(zip(result['deployment_id'], result['n_windows']))
+    self.assertEqual(counts, {d1: 2, d2: 1, d3: 0})
+
+  def test_sampling_effort_date_bins_week_no_deployment_stratification(self):
+    db, _, _, _, _ = self.make_two_deployment_sampling_setup()
+    result = db.sampling_effort(date_bins='week')
+    self.assertLen(result, 2)
+    self.assertEqual(result['n_windows'].sum(), 3)
+
+  def test_sampling_effort_by_deployment_and_date_bins_surfaces_coverage_gap(
+      self,
+  ):
+    db, d1, d2, _, _ = self.make_two_deployment_sampling_setup()
+    result = db.sampling_effort(by_deployment=True, date_bins='week')
+    # Two deployments x two weeks (the union of weeks touched by either
+    # deployment) = 4 rows, even though each deployment only has data in
+    # one of the two weeks.
+    self.assertLen(result, 4)
+    lookup = {
+        (row.deployment_id, row.date_bin_label): row.n_windows
+        for row in result.itertuples()
+    }
+    week1 = [k[1] for k in lookup if k[0] == d1][0]
+    self.assertEqual(lookup[(d1, week1)], 2)
+    # d1 has a zero-window row for the week only d2 has data in, and
+    # vice versa -- this is the whole point of the coverage-gap grid.
+    other_week = [k[1] for k in lookup if k[0] == d2 and lookup[k] == 1][0]
+    self.assertEqual(lookup[(d1, other_week)], 0)
+    self.assertEqual(lookup[(d2, week1)], 0)
+
+  def test_sampling_effort_explicit_date_bins_independent_of_data(self):
+    db, d1, _, _, _ = self.make_two_deployment_sampling_setup()
+    bins = [
+        (dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc), 'bin_a'),
+        (dt.datetime(2024, 2, 1, tzinfo=dt.timezone.utc), 'bin_b'),
+    ]
+    result = db.sampling_effort(
+        by_deployment=True,
+        date_bins=bins,
+        deployments_filter=config_dict.create(eq=dict(id=d1)),
+    )
+    # Both explicit bins appear for d1, even though d1 has no recordings
+    # at all in 'bin_b' -- the explicit list is its own fixed universe.
+    counts = dict(zip(result['date_bin_label'], result['n_windows']))
+    self.assertEqual(counts, {'bin_a': 2, 'bin_b': 0})
+
+  def test_sampling_effort_deployments_filter(self):
+    db, d1, d2, _, _ = self.make_two_deployment_sampling_setup()
+    result = db.sampling_effort(
+        by_deployment=True,
+        deployments_filter=config_dict.create(eq=dict(id=d1)),
+    )
+    self.assertEqual(list(result['deployment_id']), [d1])
+    self.assertEqual(result['n_windows'].iloc[0], 2)
+
+  def test_sampling_effort_deployments_filter_no_match_returns_empty(self):
+    db, _, _, _, _ = self.make_two_deployment_sampling_setup()
+    result = db.sampling_effort(
+        by_deployment=True,
+        deployments_filter=config_dict.create(eq=dict(name='nonexistent')),
+    )
+    self.assertEmpty(result)
+
+  def test_sampling_effort_recordings_filter(self):
+    db, d1, d2, r1, r2 = self.make_two_deployment_sampling_setup()
+    result = db.sampling_effort(
+        recordings_filter=config_dict.create(eq=dict(filename='f2.wav'))
+    )
+    self.assertEqual(result['n_windows'].iloc[0], 1)
+
+  def test_sampling_effort_start_end_date_filter(self):
+    db, _, _, _, _ = self.make_two_deployment_sampling_setup()
+    result = db.sampling_effort(
+        start_date=dt.datetime(2024, 1, 10, tzinfo=dt.timezone.utc)
+    )
+    self.assertEqual(result['n_windows'].iloc[0], 1)
+    result = db.sampling_effort(
+        end_date=dt.datetime(2024, 1, 10, tzinfo=dt.timezone.utc)
+    )
+    self.assertEqual(result['n_windows'].iloc[0], 2)
+
+  def test_sampling_effort_naive_start_end_date_raises(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.sampling_effort(start_date=dt.datetime(2024, 1, 1))
+    with self.assertRaises(ValueError):
+      db.sampling_effort(end_date=dt.datetime(2024, 1, 1))
+
+  def test_sampling_effort_naive_custom_date_bins_raises(self):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.sampling_effort(date_bins=[(dt.datetime(2024, 1, 1), 'x')])
+
+  def test_sampling_effort_recordings_filter_wrong_column_raises_clearly(
+      self,
+  ):
+    db = self.make_db()
+    with self.assertRaises(ValueError):
+      db.sampling_effort(
+          recordings_filter=config_dict.create(eq=dict(not_a_col=1))
+      )
+
+  def test_sampling_effort_empty_database(self):
+    db = self.make_db()
+    self.assertEqual(db.sampling_effort()['n_windows'].iloc[0], 0)
+    self.assertEmpty(db.sampling_effort(by_deployment=True))
+    self.assertEmpty(db.sampling_effort(date_bins='week'))
+    self.assertEmpty(db.sampling_effort(by_deployment=True, date_bins='week'))
+
+  def test_sampling_effort_no_scores_written_but_recordings_exist(self):
+    db = self.make_db()
+    deployment_id, _ = self.insert_deployment_with_recordings(
+        db, num_recordings=2
+    )
+    result = db.sampling_effort(by_deployment=True)
+    self.assertEqual(result['n_windows'].iloc[0], 0)
+    self.assertEqual(result['deployment_id'].iloc[0], deployment_id)
+
   def test_add_detections_from_threshold(self):
     db = self.make_db()
     deployment_id, recording_ids = self.insert_deployment_with_recordings(
@@ -1458,7 +2430,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
         [0.0],
         [3.0],
         np.array([[0.5, 0.1]], dtype=np.float16),
-        handle_existing='overwrite',
+        handle_existing_recordings='overwrite',
     )
     # Nothing scores >= 0.9 anymore, so a re-scan finds no new detections,
     # but the previously-inserted one should still be untouched.

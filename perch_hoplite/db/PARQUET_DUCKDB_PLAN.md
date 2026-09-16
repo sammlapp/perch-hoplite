@@ -1,5 +1,67 @@
 # Plan: Parquet + DuckDB/SQLite backend for wide per-window class scores
 
+## Implementation status (current)
+
+`perch_hoplite/db/parquet_scores_impl.py` is implemented and diverges from
+this plan in one deliberate simplification, plus has grown a couple of
+capabilities beyond what's written below:
+
+- **No chunking.** Q9's chunked-score-files design (`score_chunk_path`,
+  multiple chunk Parquet files per deployment, `on_existing='skip'/'error'/
+  'overwrite'`) was **not built**. The shipped implementation is simpler:
+  exactly one Parquet file per deployment
+  (`deployment_parquet_path(deployment_id)`), written by
+  `insert_deployment_scores(..., handle_existing='error'|'overwrite')` as a
+  **whole-file replacement** — see that method's docstring. `'overwrite'`
+  replaces the entire file with exactly the rows passed in (not a merge);
+  there is no partial/incremental append and no chunk numbering. This keeps
+  `remove_deployment()` a plain file delete (matches Q6 as planned) and
+  keeps every query a single `read_parquet()` per deployment rather than a
+  glob over chunks. Revisit only if a real deployment turns out too large
+  to hold in memory for one write (Q9's original motivation).
+- **Query API is `select_scores`/`select_detections`, not
+  `get_class_scores`.** What Q4 sketched as a single `get_class_scores(...)`
+  became a considerably richer `select_scores(class_name, selection='top'|
+  'random'|'binned', by_deployment=..., date_bins=..., deployments_filter=...,
+  recordings_filter=..., min_score=..., max_score=..., ...)` — one query
+  composing selection mode, independent stratification, and filters, plus
+  a parallel `select_detections()` for the `detections` table. See their
+  docstrings for the full parameter set and examples.
+- **`get_scores_batch(deployment_id, recording_ids, start_times,
+  end_times)`** was added beyond the original plan: fetches full
+  `N_classes`-wide score vectors for specific `(recording, offsets)` keys
+  (e.g. context around a detection), independent of `select_scores`'s
+  single-class-column path.
+- **Empirical finding: single-class lookup scales gently with class
+  count, not with data volume.** `parquet_scores_class_scaling_test.ipynb`
+  benchmarks `select_scores` for one class against DBs with 1/10/100/1,000
+  total classes, holding row count fixed. At small Parquet files (100
+  deployments × 1,000 windows), the slowdown from 1 to 1,000 classes was
+  ~10x (absolute times still small, ~13ms → ~130ms) — attributed to
+  per-file Parquet footer/schema metadata parsing scaling with column
+  count, reparsed on every deployment file scan, even though DuckDB
+  correctly projects only the target column (confirmed via
+  `_scores_union_query`, which selects the single class column, not `*`).
+  Re-run with more realistic sizes (100k windows/deployment), the
+  slowdown at 1,000 classes dropped to only ~2x — i.e. the fixed
+  per-column metadata cost is amortized against a larger per-file row
+  count, so it matters least exactly when it would otherwise hurt most.
+  **Net: lookups stay fast whether the DB is small (fast regardless of
+  class count) or large-with-many-classes (metadata overhead is a small
+  fraction of a bigger scan)** — the class-count scaling cost is real but
+  not a practical concern at realistic deployment sizes.
+
+## Next Steps
+1. ~~consider making the recording rather than the deployment the atomic unit
+   for addition~~ — RESOLVED. Considered a chunked-score-files design (see
+   Q9 below, "Chunked score files and `recordings.score_chunk_path`"), but
+   the shipped implementation is simpler: one Parquet file per deployment,
+   written whole-file by `insert_deployment_scores()` (see "Implementation
+   status" above). Revisit Q9's chunking design only if a real deployment
+   proves too large to hold in memory for one write.
+2. add documentation in db/README.md of the interface design/methods/usage examples
+
+
 ## Motivation
 
 Hoplite's existing backends (`in_mem_impl`, `sqlite_usearch_impl`) are built
@@ -119,14 +181,17 @@ window API shape.
   class vocabulary — see Q5).
 - `deployments` — unchanged (`id`, `name`, `project`, `latitude`,
   `longitude`, extra columns).
-- `recordings` — unchanged (`id`, `filename`, `datetime`, `deployment_id`,
-  extra columns).
+- `recordings` — adds one nullable column vs. other backends:
+  `score_chunk_path` (`id`, `filename`, `datetime`, `deployment_id`,
+  `score_chunk_path`, extra columns). `score_chunk_path` is NULL until the
+  recording's scores have been written, then points at the chunk Parquet
+  file that contains its rows — see Q9.
 - `detections` — new (see above); the id-bearing, reviewable unit that
   replaces `windows`.
 - `annotations` — unchanged (human labels, keyed by `recording_id` +
   offsets, same as other backends).
 
-**Score store (Parquet, one file per deployment):**
+**Score store (Parquet, one or more chunk files per deployment — see Q9):**
 - Columns: `recording_id` (or `file` path, matching whichever `recordings`
   join key is chosen), `start_time`, `end_time`, and one column per class
   (`float16` scores). No synthetic row id.
@@ -135,9 +200,12 @@ window API shape.
   `prediction_dtype`, `class_vocabulary_version`, `preprocessing_version`,
   `creation_timestamp`. This mirrors what `hoplite_metadata` already does at
   the whole-DB level (e.g. `usearch_config`), just scoped per Parquet file.
-- Queried via DuckDB's `parquet_scan()`/`read_parquet()`, joined directly
-  against the native `recordings`/`deployments` tables in the same
-  connection (no ATTACH needed, since everything is already DuckDB-native).
+- Queried via DuckDB's `parquet_scan()`/`read_parquet()`, either globbed
+  across all of a deployment's chunk files or resolved directly from
+  `recordings.score_chunk_path` when the query is already scoped to specific
+  recordings, joined against the native `recordings`/`deployments` tables in
+  the same connection (no ATTACH needed, since everything is already
+  DuckDB-native).
 
 ## Key design questions
 
@@ -171,14 +239,17 @@ layer.
 ### Q2: Score insertion API — RESOLVED: batch-only
 `insert_window()` (per-row, single-embedding) has no natural analogue here
 since there is no `windows` table. Scores are written exclusively via a
-batch API, e.g. `insert_scores_batch(deployment_id, scores_df, class_names,
-parquet_metadata)`, which writes the deployment's Parquet file in one shot.
-This matches how scoring actually happens (one inference pass over a whole
-deployment) and avoids ever doing row-by-row Parquet writes (extremely slow
-— Parquet is not designed for single-row appends). Per-detection insertion
-(`insert_detection`/`insert_detections_batch`, into the small `detections`
-table) is separate and cheap either way, since that table is a normal
-DuckDB table, not Parquet.
+batch API, e.g. `insert_deployment_scores(deployment_id, scores_df,
+class_names, parquet_metadata, on_existing='skip')`, which writes one new
+chunk Parquet file per call (see Q9 — a deployment may be written in one
+call or several, at the caller's discretion). This matches how scoring
+actually happens (one inference pass over a whole deployment, or several
+passes if the caller chunks it for memory reasons) and avoids ever doing
+row-by-row Parquet writes (extremely slow — Parquet is not designed for
+single-row appends). Per-detection insertion (`insert_detection`/
+`insert_detections_batch`, into the small `detections` table) is separate
+and cheap either way, since that table is a normal DuckDB table, not
+Parquet.
 
 > a is good, but we will primarily or exclusively use batch insertion methods.
 
@@ -203,18 +274,24 @@ concept in this backend. Likewise `insert_window`, `get_window`,
 since there is no `windows` table (see "Rethinking `windows`" above).
 
 Separate, explicitly-named methods are added for the real access patterns:
-- `insert_scores_batch(...)` / bulk Parquet write (Q2).
+- `insert_deployment_scores(...)` / whole-file Parquet write (Q2). Shipped
+  as `insert_deployment_scores`, not `insert_scores_batch` as originally
+  named here.
 - `get_class_scores(class_name, deployments_filter=..., threshold=...)` —
   the "top scores for one class across many files" query from the notebook,
   using DuckDB column projection + row-group pruning against the Parquet
-  scan(s), optionally joined with `recordings`/`deployments`.
-- `get_scores_batch(recording_ids, start_times, end_times)` or similar — a
-  batch score-vector fetch by explicit `(recording, offsets)` keys, for
-  cases that need the full class vector at specific clips (e.g. context
-  around a detection).
+  scan(s), optionally joined with `recordings`/`deployments`. **Superseded
+  by the richer `select_scores(...)`** actually shipped — see
+  "Implementation status" at the top of this doc.
+- `get_scores_batch(deployment_id, recording_ids, start_times, end_times)` —
+  shipped as planned: a batch score-vector fetch by explicit `(recording,
+  offsets)` keys, for cases that need the full class vector at specific
+  clips (e.g. context around a detection).
 - `insert_detection(s)`, `get_detection`, `remove_detection`,
   `get_detection_annotations` — the `detections`-table CRUD that plays the
   annotation-adjacent role `windows` played in other backends (see below).
+  Shipped as planned, plus `select_detections(...)` and
+  `add_detections_from_threshold(...)` for bulk detection queries/population.
 
 > these methods will return not implemented errors, and we will implement separate methods for score querying and retrieval.
 
@@ -249,16 +326,18 @@ time. Two realistic scenarios need an answer:
 Orphaned Parquet rows were rejected: leaving deleted recordings' scores
 behind in Parquet risks accidentally surfacing them again in a later query.
 Since Parquet only supports whole-file rewrites (not row-level delete), and
-there is one Parquet file per deployment:
+every chunk file's rows belong to exactly one deployment (Q9):
 
 - `remove_recording()` → `NotImplementedError`. Deleting a single
-  recording's rows would require rewriting its whole deployment's Parquet
-  file; not supported.
+  recording's rows would require rewriting the whole chunk file it lives in
+  (located via `recordings.score_chunk_path`); not supported.
 - `remove_deployment()` → deletes the deployment's metadata rows
   (`deployments`, cascading to `recordings`/`annotations`/`detections` as
-  today) **and** deletes the deployment's entire Parquet file outright. This
-  is exact (no orphaning) and cheap (file delete, not rewrite), since
-  deployment is exactly the granularity at which Parquet files are split.
+  today) **and** deletes all of the deployment's chunk Parquet files
+  outright (`SELECT DISTINCT score_chunk_path FROM recordings WHERE
+  deployment_id = ?`, then unlink each). This is exact (no orphaning) and
+  cheap (file deletes, not rewrites), since a chunk never spans more than
+  one deployment.
 
 ### Q7: Concurrency / write model — RESOLVED
 A single Parquet file has a single writer (whoever computed that
@@ -275,25 +354,123 @@ class vocabulary is fixed for the life of the database (Q5), so every
 deployment's Parquet file has the same columns and there is no
 union-of-schemas scenario to handle.
 
-## Suggested next steps once the above are answered
-1. Design the DuckDB DDL and filter-dict → SQL compiler for
-   `deployments`/`recordings`/`annotations`/`detections`/`hoplite_metadata`,
-   using `sqlite_usearch_impl.py` as a reference for shape/semantics (not
-   for reusable code, since the dialect differs).
-2. Implement `parquet_scores_impl.py`: a single DuckDB connection owning the
-   above tables, plus a Parquet writer/reader pair for the per-deployment
-   score files (bulk write in `insert_scores_batch`, DuckDB `parquet_scan`
-   reads for `get_class_scores`/`get_scores_batch`).
-3. Implement `detections` CRUD (`insert_detection(s)`, `get_detection`,
-   `remove_detection`, `get_detection_annotations`) and the
-   threshold-scan helper (`add_detections_from_threshold` or similar) that
-   populates it from a Parquet scan.
-4. Add a `parquet_scores` entry to `db/tests/test_utils.py`'s `DB_TYPES` /
-   `make_db()` so the existing conformance suite
-   (`hoplite_test.py`/`interface_test.py`) runs against it for the
-   deployments/recordings/annotations/metadata parts of the interface,
-   marking the window/embedding-specific tests as not-applicable
-   (`NotImplementedError` expected) for this backend.
-5. Add scores- and detections-specific tests mirroring the notebook's "top
-   score per class across deployments" query, the metadata-provenance
-   round-trip, and `remove_deployment()`'s exact-delete behavior.
+### Q9: Chunked score files and `recordings.score_chunk_path` — RESOLVED, then not built
+**Not implemented.** The design below was the plan, but the shipped
+`insert_deployment_scores()` is simpler: exactly one Parquet file per
+deployment, written as a whole-file replacement, no `score_chunk_path`
+column, no chunk numbering, no `on_existing='skip'` dedup logic (only
+`handle_existing='error'|'overwrite'`, where `'overwrite'` replaces the
+entire file with exactly the batch passed in). See "Implementation status"
+at the top of this doc. Left below for the reasoning trail in case a real
+deployment does turn out too large to hold in memory for one write, which
+would make this design worth revisiting.
+
+**Now being built as an opt-in extension** — see
+`PARQUET_CHUNKING_IMPLEMENTATION_PLAN.md` for the concrete, code-level
+implementation plan (exact call sites, schema migration, test additions),
+written against the actual shipped `parquet_scores_impl.py` rather than
+this speculative design.
+
+For most deployments, holding the whole score table in memory before one
+Parquet write is fine (MB-scale; even 100k windows × 15k classes
+unthresholded is ~6GB, which is acceptable as a rare worst case). But a
+caller with a very large deployment or a memory-constrained machine should
+be able to split the write into several smaller calls instead. Resolution:
+make the **chunk file**, not the deployment, the unit a single
+`insert_deployment_scores()` call produces — a deployment ends up backed by
+one or more chunk Parquet files, and the caller controls chunking only by
+choosing how many recordings' worth of scores to pass to each call, not by
+naming or numbering chunks themselves.
+
+- **One call = one new chunk file.** Each `insert_deployment_scores()` call
+  writes exactly one new Parquet file (internally named/numbered, e.g.
+  `{deployment_id}_{n}.parquet` with `n` auto-assigned by listing existing
+  chunks for that deployment); it never appends to or rewrites an existing
+  chunk as part of a normal write. A caller who scores a whole deployment in
+  one call gets exactly the original one-file-per-deployment behavior; a
+  caller who calls it once per recording (or per N recordings) gets many
+  small chunk files instead, bounding peak memory to whatever they choose to
+  pass per call.
+- **`recordings.score_chunk_path`** (new nullable column, see "Proposed
+  structure" above) records which chunk file holds a given recording's
+  scores, NULL until first written. This is what makes a recording's scores
+  locatable in O(1) regardless of how many chunks a deployment has, and is
+  the cheap check that powers the next point.
+- **Handling a recording that's already been scored.** Before writing a new
+  chunk, look up `score_chunk_path` for every recording in the incoming
+  batch. Given the database already commits to one fixed, versioned
+  classifier for its whole lifetime (Q5/Q8) — so two score rows for the same
+  `(recording_id, start_time, end_time)` should never legitimately disagree
+  — the default is to treat a duplicate as redundant, not conflicting:
+  - `on_existing='skip'` (default) — drop any recording that already has a
+    `score_chunk_path` from the batch before writing; cheap (one column
+    lookup per recording, touches only the new chunk file). Safe because a
+    caller who only ever calls this once per deployment never has any
+    recording with a pre-existing `score_chunk_path`, so this check is a
+    no-op for that (common) usage.
+  - `on_existing='error'` — same lookup, but raise if any recording in the
+    batch already has a chunk path, for callers who want to assert "these
+    are all new" rather than silently drop rows.
+  - `on_existing='overwrite'` — for correcting a bad run, not routine use.
+    Locate the old chunk file(s) referenced by the affected recordings
+    (possibly several, if the batch spans recordings written in different
+    prior calls), rewrite each minus the stale rows, write the new chunk,
+    and update `score_chunk_path` for every moved recording. Unlike `skip`/
+    `error`, cost here is *not* bounded by the new batch's size — it's
+    bounded by however fragmented the affected recordings' prior chunks are
+    — so this mode should be documented as the expensive path.
+- **Write ordering / crash safety.** A chunk file write (filesystem) and the
+  `recordings.score_chunk_path` update (DuckDB) are not one atomic
+  transaction. Write the new chunk file first (to a temp path, then atomic
+  rename into place), and only update `recordings` afterward. If the
+  process dies between the two, the result is an orphaned-but-harmless
+  Parquet file — never a `recordings` row pointing at a chunk file that
+  doesn't exist, which would break reads.
+- **Query side.** `parquet_scan()` over a deployment now globs its chunk
+  files (`{deployment_id}_*.parquet`) or, when a query is already scoped to
+  specific recordings, resolves `score_chunk_path` directly per recording
+  and reads only the relevant chunk(s) — a pruning win over globbing when
+  the caller already knows which recordings it wants.
+- **Why chunk boundaries stay deployment-scoped rather than fully
+  arbitrary** (considered and rejected): keeping every chunk file's rows
+  drawn from a single deployment is what keeps `remove_deployment()` a plain
+  file-delete (Q6) instead of a rewrite-minus-rows operation, and what lets
+  deployment-filtered queries skip whole files at the DuckDB planning stage
+  instead of opening every file and filtering rows after the join. Both
+  properties would be lost if a chunk could mix recordings from different
+  deployments.
+
+## Suggested next steps once the above are answered — mostly DONE
+
+1. ~~Design the DuckDB DDL and filter-dict → SQL compiler~~ — DONE, see
+   `deployments`/`recordings`/`annotations`/`detections`/`hoplite_metadata`
+   DDL in `_setup_tables()` and the filter compiler
+   (`format_sql_where_conditions`) in `parquet_scores_impl.py`.
+2. ~~Implement `parquet_scores_impl.py`~~ — DONE, but simpler than planned:
+   one Parquet file per deployment (no chunking/`score_chunk_path`; see
+   "Implementation status" above), written whole-file by
+   `insert_deployment_scores()`, read via `select_scores()`/
+   `get_scores_batch()` (not the originally-named `get_class_scores`).
+3. ~~Implement `detections` CRUD~~ — DONE: `insert_detection(s)`,
+   `get_detection`, `remove_detection`, `get_detection_annotations`,
+   `select_detections()`, and `add_detections_from_threshold()` all exist
+   as planned.
+4. **Not done.** `db/tests/test_utils.py`'s `DB_TYPES`/`make_db()` (the
+   shared conformance suite run by `hoplite_test.py`/`interface_test.py`
+   across backends) has no `parquet_scores` entry — `ParquetScoresDB` is
+   exercised only by its own standalone
+   `db/tests/parquet_scores_impl_test.py`, not the cross-backend suite.
+   Worth doing if/when this backend needs to guarantee interface parity
+   with the other backends on the parts that do apply
+   (deployments/recordings/annotations/metadata), with the window/embedding
+   tests marked not-applicable (`NotImplementedError` expected) for this
+   backend.
+5. ~~Add scores- and detections-specific tests~~ — DONE:
+   `db/tests/parquet_scores_impl_test.py` (~1,500 lines) covers deployment/
+   recording/annotation/detection CRUD, extra columns, duplicate handling,
+   `remove_deployment()`'s exact-delete behavior, and more. Separately,
+   `parquet_scores_stress_test.ipynb` and
+   `parquet_scores_class_scaling_test.ipynb` cover realistic-scale
+   performance characteristics (not correctness) for `select_scores()`
+   and friends — see "Implementation status" above for the class-scaling
+   finding.
