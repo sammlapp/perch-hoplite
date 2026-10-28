@@ -18,7 +18,7 @@
 This backend is not exercised by `hoplite_test.py`/`interface_test.py`'s
 `DB_TYPES`-parametrized conformance suite: those tests assume every backend
 has a `windows` table and embedding-vector storage/search, neither of which
-`ParquetScoresDB` has (see `PARQUET_DUCKDB_PLAN.md`). This file exercises the
+`ParquetScoresDB` has (see `PARQUET_SCORES_DESIGN.md`). This file exercises the
 parts of `HopliteDBInterface` this backend does implement, plus its
 backend-specific score/detection APIs.
 """
@@ -1523,7 +1523,7 @@ class ParquetScoresDBTest(parameterized.TestCase):
     self.assertIn('latitude', merged.columns)
 
   # ---------------------------------------------------------------------
-  # Multi-chunk score storage (PARQUET_DUCKDB_PLAN.md, Q9).
+  # Multi-chunk score storage (PARQUET_SCORES_DESIGN.md).
   # ---------------------------------------------------------------------
 
   def test_multiple_calls_write_disjoint_chunks_queryable_together(self):

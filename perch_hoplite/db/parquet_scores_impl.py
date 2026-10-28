@@ -25,7 +25,7 @@ is columnar ("give me every/top scores for class X across many files") rather
 than vector similarity search.
 2. sparse, thresholded *detections* (single-class hits) with time bounds
 
-Design (see `PARQUET_DUCKDB_PLAN.md` for the full design discussion):
+Design (see `PARQUET_SCORES_DESIGN.md` for the full design summary):
   - All relational metadata (`hoplite_metadata`, `deployments`, `recordings`,
     `annotations`, `detections`) lives in native DuckDB tables in a single
     `.duckdb` file, read and written through a single DuckDB connection.
@@ -38,7 +38,7 @@ Design (see `PARQUET_DUCKDB_PLAN.md` for the full design discussion):
   - The wide class-score matrix itself lives in one or more Parquet "chunk"
     files per deployment (not in DuckDB tables), written in bulk (one new
     chunk file per `insert_deployment_scores()` call -- see that method and
-    PARQUET_DUCKDB_PLAN.md, Q9) and read via DuckDB's
+    PARQUET_SCORES_DESIGN.md) and read via DuckDB's
     `parquet_scan`/`read_parquet` over all of a deployment's chunks at
     once. `recordings.score_chunk_path` records which chunk file holds a
     given recording's scores.
@@ -642,14 +642,14 @@ def add_recording_metadata(
 
 @dataclasses.dataclass
 class ParquetScoresDB(interface.HopliteDBInterface):
-  """DuckDB + per-deployment-Parquet database for wide class-score outputs.
+  """DuckDB + Parquet database for wide class-score outputs.
 
   See the module docstring for the overall design. In short: relational
   metadata (deployments/recordings/annotations/detections/hoplite_metadata)
   lives in native DuckDB tables in a single `.duckdb` file; the wide
-  per-window class-score matrices live in one Parquet file per deployment
-  under `db_path/scores/`, read via DuckDB's Parquet scanning rather than
-  through any table in the `.duckdb` file itself.
+  per-window class-score matrices live in one or more Parquet chunk files
+  per deployment under `db_path/scores/`, read via DuckDB's Parquet
+  scanning rather than through any table in the `.duckdb` file itself.
 
   Attributes:
     db_path: The path to the database directory.
@@ -676,7 +676,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     new chunk per `insert_deployment_scores()` call) -- there is no single,
     fixed "the" Parquet file for a deployment. Derived from
     `recordings.score_chunk_path` (the source of truth for where a
-    recording's scores live -- see PARQUET_DUCKDB_PLAN.md, Q9) rather than
+    recording's scores live -- see PARQUET_SCORES_DESIGN.md) rather than
     a directory listing, so this reflects exactly the chunks that are
     actually referenced by a recording, in a stable order.
     """
@@ -1045,7 +1045,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     `cursor()` starts a fresh session state, so e.g. the `TimeZone` pin set
     in `create()` must be re-applied explicitly here, or datetime handling
     on the split copy would silently depend on the host's local timezone
-    instead. Per Q1/Q7 in PARQUET_DUCKDB_PLAN.md, only one process should be
+    instead. Per PARQUET_SCORES_DESIGN.md (single writer), only one process should be
     treated as the writer for a given database file regardless.
 
     Returns:
@@ -1243,7 +1243,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     deployment (DuckDB does not support `ON DELETE CASCADE`, so this is done
     explicitly), and deletes all of the deployment's score-chunk Parquet
     files outright (rather than leaving orphaned rows behind -- see
-    PARQUET_DUCKDB_PLAN.md, Q6/Q9).
+    PARQUET_SCORES_DESIGN.md).
     """
     deployment_id = int(deployment_id)
 
@@ -1350,13 +1350,13 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     """Not implemented.
 
     Deleting a single recording's scores would require rewriting the whole
-    of its deployment's Parquet file (Parquet has no row-level delete); see
-    PARQUET_DUCKDB_PLAN.md, Q6. Use `remove_deployment()` instead.
+    score chunk file it lives in (Parquet has no row-level delete); see
+    PARQUET_SCORES_DESIGN.md. Use `remove_deployment()` instead.
     """
     raise NotImplementedError(
         'remove_recording() is not supported by ParquetScoresDB, since'
         ' deleting a single recording would require rewriting its whole'
-        " deployment's Parquet file. Use remove_deployment() instead."
+        ' score chunk file. Use remove_deployment() instead.'
     )
 
   # ---------------------------------------------------------------------
@@ -1377,7 +1377,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
         'ParquetScoresDB has no windows table -- scores are written in bulk'
         ' via insert_deployment_scores() and addressed by (recording_id,'
         ' start_time, end_time), not by a per-window id. See'
-        ' PARQUET_DUCKDB_PLAN.md.'
+        ' PARQUET_SCORES_DESIGN.md.'
     )
 
   def get_window(
@@ -2048,7 +2048,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
 
     This is the only way to write scores in `ParquetScoresDB`: there is no
     per-row/per-window insertion, since Parquet is not designed for
-    single-row appends (see PARQUET_DUCKDB_PLAN.md, Q2). May be called once
+    single-row appends (see PARQUET_SCORES_DESIGN.md). May be called once
     per deployment (after a single inference pass has produced scores for
     every scored clip in the deployment), or multiple times with disjoint
     recordings (e.g. to bound peak memory on a very large deployment, or a
@@ -2200,7 +2200,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     # Update `recordings` only after the chunk file is durably in place --
     # a crash between the rename above and this update leaves an
     # orphaned-but-harmless chunk file, never a `recordings` row pointing at
-    # a chunk file that doesn't exist (see PARQUET_DUCKDB_PLAN.md, Q9).
+    # a chunk file that doesn't exist (see PARQUET_SCORES_DESIGN.md).
     new_recording_ids = [int(r) for r in recording_ids]
     placeholders = ', '.join(['?'] * len(new_recording_ids))
     self.db.execute(
@@ -2267,7 +2267,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
           class_labels,
       )
       # NOTE: `class_labels` (and therefore column order/schema) is fixed
-      # for the database's lifetime (PARQUET_DUCKDB_PLAN.md, Q5/Q8), so
+      # for the database's lifetime (PARQUET_SCORES_DESIGN.md), so
       # `remaining` and `new_rows_for_chunk` always share the same schema
       # and `concat_tables` needs no schema unification.
       updated_table = pa.concat_tables([remaining, new_rows_for_chunk])
@@ -3585,7 +3585,7 @@ class ParquetScoresDB(interface.HopliteDBInterface):
     # Resolve only the chunk files that actually contain a requested
     # recording, rather than every chunk file in the deployment -- a real
     # pruning win when the request is scoped to a handful of recordings out
-    # of a much larger deployment (see PARQUET_DUCKDB_PLAN.md, Q9).
+    # of a much larger deployment (see PARQUET_SCORES_DESIGN.md).
     unique_recording_ids = sorted(set(int(r) for r in recording_ids))
     placeholders = ', '.join(['?'] * len(unique_recording_ids))
     relevant_chunk_rows = self.db.execute(
